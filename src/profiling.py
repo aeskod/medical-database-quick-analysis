@@ -21,7 +21,25 @@ MISSING_VALUE_TOKENS = {
 }
 
 BOOLEAN_TOKENS = {"true", "false", "yes", "no", "y", "n", "0", "1"}
-ID_NAME_HINTS = ("id", "patient_id", "subject_id", "record_id", "case_id", "mrn")
+BINARY_VALUE_SETS = {
+    frozenset({"0", "1"}),
+    frozenset({"true", "false"}),
+    frozenset({"yes", "no"}),
+    frozenset({"y", "n"}),
+    frozenset({"dead", "alive"}),
+    frozenset({"event", "censored"}),
+}
+ID_NAME_HINTS = (
+    "id",
+    "patient_id",
+    "subject_id",
+    "record_id",
+    "case_id",
+    "participant_id",
+    "person_id",
+    "sample_id",
+    "mrn",
+)
 
 
 def normalize_missing_values(df: pd.DataFrame) -> pd.DataFrame:
@@ -105,17 +123,62 @@ def profile_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         non_missing = series.dropna()
         non_missing_count = int(len(non_missing))
         unique_count = int(non_missing.nunique(dropna=True))
+        unique_ratio = unique_count / non_missing_count if non_missing_count else 0
         missing_percent = round((missing_count / row_count * 100) if row_count else 0.0, 2)
+        numeric_values = pd.to_numeric(non_missing, errors="coerce")
+        numeric_parse_count = int(numeric_values.notna().sum())
+        numeric_parse_rate = numeric_parse_count / non_missing_count if non_missing_count else 0
+        date_values = pd.to_datetime(non_missing, errors="coerce", format="mixed")
+        date_parse_count = int(date_values.notna().sum())
+        date_parse_rate = date_parse_count / non_missing_count if non_missing_count else 0
+        numeric_like = numeric_parse_rate >= 0.8 and numeric_parse_count > 0
+        parsed_numeric_values = numeric_values.dropna()
+        min_value = (
+            _to_python_scalar(parsed_numeric_values.min())
+            if numeric_like and not parsed_numeric_values.empty
+            else None
+        )
+        max_value = (
+            _to_python_scalar(parsed_numeric_values.max())
+            if numeric_like and not parsed_numeric_values.empty
+            else None
+        )
+        is_non_negative = bool(
+            numeric_like
+            and not parsed_numeric_values.empty
+            and (parsed_numeric_values >= 0).all()
+            and numeric_parse_count == non_missing_count
+        )
+        is_binary_like = _is_binary_like(non_missing)
+        is_low_cardinality = 2 <= unique_count <= 20
+
+        detected_type = infer_column_type(series)
+        is_id_like = _is_id_like_column(
+            column,
+            unique_ratio,
+            non_missing_count,
+            detected_type,
+            numeric_parse_rate,
+        )
 
         profile_rows.append(
             {
                 "column_name": column,
-                "detected_type": infer_column_type(series),
+                "detected_type": detected_type,
                 "missing_count": missing_count,
                 "missing_percent": missing_percent,
                 "non_missing_count": non_missing_count,
                 "unique_count": unique_count,
                 "example_values": _format_example_values(non_missing),
+                "unique_ratio": unique_ratio,
+                "numeric_parse_rate": numeric_parse_rate,
+                "date_parse_rate": date_parse_rate,
+                "min_value": min_value,
+                "max_value": max_value,
+                "is_non_negative": is_non_negative,
+                "is_binary_like": is_binary_like,
+                "is_low_cardinality": is_low_cardinality,
+                "is_id_like": is_id_like,
             }
         )
 
@@ -129,6 +192,15 @@ def profile_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             "non_missing_count",
             "unique_count",
             "example_values",
+            "unique_ratio",
+            "numeric_parse_rate",
+            "date_parse_rate",
+            "min_value",
+            "max_value",
+            "is_non_negative",
+            "is_binary_like",
+            "is_low_cardinality",
+            "is_id_like",
         ],
     )
 
@@ -167,6 +239,58 @@ def _values_look_identifier_like(values: Iterable[object]) -> bool:
     average_length = sum(len(value) for value in string_values) / len(string_values)
 
     return identifier_like_count / len(string_values) >= 0.95 and average_length <= 40
+
+
+def _is_binary_like(series: pd.Series) -> bool:
+    values = {_canonical_profile_value(value) for value in series.dropna()}
+    return values in BINARY_VALUE_SETS
+
+
+def _canonical_profile_value(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip().lower()
+
+    if isinstance(value, (bool, np.bool_)):
+        return str(bool(value)).lower()
+
+    if isinstance(value, (int, float, np.integer, np.floating)) and not pd.isna(value):
+        float_value = float(value)
+        if float_value.is_integer():
+            return str(int(float_value))
+        return str(float_value)
+
+    return str(value).strip().lower()
+
+
+def _is_id_like_column(
+    column_name: object,
+    unique_ratio: float,
+    non_missing_count: int,
+    detected_type: str,
+    numeric_parse_rate: float,
+) -> bool:
+    has_id_hint = _has_id_name_hint(str(column_name).lower())
+
+    if has_id_hint and unique_ratio >= 0.8 and non_missing_count > 10:
+        return True
+
+    if detected_type == "id_like":
+        return True
+
+    if numeric_parse_rate >= 0.95:
+        return False
+
+    return unique_ratio >= 0.95 and non_missing_count > 10
+
+
+def _to_python_scalar(value: object) -> object:
+    if pd.isna(value):
+        return None
+
+    if isinstance(value, np.generic):
+        return value.item()
+
+    return value
 
 
 def _format_example_values(series: pd.Series) -> str:

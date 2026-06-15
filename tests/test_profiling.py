@@ -87,6 +87,15 @@ def test_profile_dataframe_returns_required_columns_and_values():
         "non_missing_count",
         "unique_count",
         "example_values",
+        "unique_ratio",
+        "numeric_parse_rate",
+        "date_parse_rate",
+        "min_value",
+        "max_value",
+        "is_non_negative",
+        "is_binary_like",
+        "is_low_cardinality",
+        "is_id_like",
     ]
 
     age_profile = profile.loc[profile["column_name"] == "age"].iloc[0]
@@ -98,7 +107,16 @@ def test_profile_dataframe_returns_required_columns_and_values():
     assert age_profile["non_missing_count"] == 3
     assert age_profile["unique_count"] == 3
     assert age_profile["example_values"] == "55, 63, 80"
+    assert age_profile["unique_ratio"] == 1.0
+    assert age_profile["numeric_parse_rate"] == 1.0
+    assert age_profile["min_value"] == 55
+    assert age_profile["max_value"] == 80
+    assert bool(age_profile["is_non_negative"]) is True
+    assert bool(age_profile["is_binary_like"]) is False
 
     assert status_profile["detected_type"] == "categorical"
     assert status_profile["missing_count"] == 1
     assert status_profile["example_values"] == "Dead, Alive"
+    assert status_profile["numeric_parse_rate"] == 0.0
+    assert bool(status_profile["is_binary_like"]) is True
+    assert bool(status_profile["is_low_cardinality"]) is True
