@@ -29,7 +29,12 @@ def test_infer_column_type_empty():
 
 def test_infer_column_type_boolean():
     assert infer_column_type(pd.Series(["yes", "No", "Y", "n"], name="event")) == "boolean"
-    assert infer_column_type(pd.Series([0, 1, 1, 0], name="flag")) == "boolean"
+    assert infer_column_type(pd.Series([True, False, True], name="flag")) == "boolean"
+
+
+def test_infer_column_type_binary():
+    assert infer_column_type(pd.Series([0, 1, 1, 0], name="event")) == "binary"
+    assert infer_column_type(pd.Series(["Dead", "Alive", "Dead"], name="status")) == "binary"
 
 
 def test_infer_column_type_integer_and_float():
@@ -114,7 +119,7 @@ def test_profile_dataframe_returns_required_columns_and_values():
     assert bool(age_profile["is_non_negative"]) is True
     assert bool(age_profile["is_binary_like"]) is False
 
-    assert status_profile["detected_type"] == "categorical"
+    assert status_profile["detected_type"] == "binary"
     assert status_profile["missing_count"] == 1
     assert status_profile["example_values"] == "Dead, Alive"
     assert status_profile["numeric_parse_rate"] == 0.0

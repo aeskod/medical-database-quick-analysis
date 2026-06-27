@@ -174,9 +174,9 @@ def score_event_candidate(column_name: str, profile_row: dict[str, Any]) -> dict
         score += 30
         reasons.append("Column is binary-like")
 
-    if profile_row.get("detected_type") == "boolean":
+    if profile_row.get("detected_type") in {"binary", "boolean"}:
         score += 20
-        reasons.append("Column is boolean")
+        reasons.append(f"Column is {profile_row.get('detected_type')}")
 
     unique_count = _unique_count(profile_row)
     if 2 < unique_count <= 6:
@@ -265,7 +265,7 @@ def score_group_candidate(column_name: str, profile_row: dict[str, Any]) -> dict
         score += 10
         reasons.append(f"Column has {_missing_percent(profile_row)}% missing values")
 
-    if profile_row.get("detected_type") in {"categorical", "boolean"}:
+    if profile_row.get("detected_type") in {"binary", "categorical", "boolean"}:
         score += 10
         reasons.append(f"Detected type is {profile_row.get('detected_type')}")
 

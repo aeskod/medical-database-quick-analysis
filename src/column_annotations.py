@@ -312,7 +312,9 @@ def _infer_meaning(column: str, profile_row: Mapping[str, Any]) -> str:
         return "Date"
     if detected_type in {"integer", "float"} and not bool(profile_row.get("is_binary_like")):
         return "Other numeric variable"
-    if detected_type in {"boolean", "categorical"} or bool(profile_row.get("is_low_cardinality")):
+    if detected_type in {"binary", "boolean", "categorical"} or bool(
+        profile_row.get("is_low_cardinality")
+    ):
         return "Other categorical variable"
     if detected_type == "text":
         return "Notes / free text"

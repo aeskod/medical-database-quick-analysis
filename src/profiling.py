@@ -74,6 +74,19 @@ def infer_column_type(series: pd.Series) -> str:
     if has_id_hint and mostly_unique:
         return "id_like"
 
+    if pd.api.types.is_bool_dtype(non_missing.dtype):
+        return "boolean"
+
+    canonical_values = {
+        _canonical_profile_value(value)
+        for value in non_missing
+    }
+    if canonical_values.issubset({"true", "false"}):
+        return "boolean"
+
+    if _is_binary_like(non_missing):
+        return "binary"
+
     if set(lower_values).issubset(BOOLEAN_TOKENS):
         return "boolean"
 

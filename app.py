@@ -39,7 +39,10 @@ from src.cohort_overview import (
     count_variable_types,
     get_default_baseline_variables,
 )
-from src.data_loading import read_dataset
+from src.data_loading import (
+    DatasetMetadata,
+    read_dataset_with_metadata,
+)
 from src.profiling import normalize_missing_values, profile_dataframe
 from src.role_suggestions import suggest_survival_roles
 from src.survival_analysis import (
@@ -89,6 +92,7 @@ DATASET_DERIVED_SESSION_KEYS = {
     "column_annotations",
     "annotation_editor_version",
     "annotation_status_message",
+    "show_more_preview_rows",
 }
 
 DATASET_DERIVED_SESSION_PREFIXES = (
@@ -118,20 +122,21 @@ def main() -> None:
     with upload_tab:
         uploaded_file = st.file_uploader(
             "Upload a dataset",
-            type=["csv", "tsv", "xlsx"],
-            help="Supported formats: CSV, TSV, XLSX",
+            type=["csv", "tsv", "txt", "xlsx"],
+            help="Supported formats: CSV, TSV, TXT, XLSX",
         )
-        st.caption("Supported formats: CSV, TSV, XLSX")
+        st.caption("Supported formats: CSV, TSV, TXT, XLSX")
 
         if uploaded_file is None:
-            st.info("Upload a CSV, TSV, or Excel file to begin.")
+            st.info("Upload a CSV, TSV, TXT, or Excel file to begin.")
         else:
             try:
                 content_digest = uploaded_file_content_digest(uploaded_file)
-                df = read_dataset(uploaded_file)
+                load_result = read_dataset_with_metadata(uploaded_file)
             except ValueError as exc:
                 st.error(str(exc))
             else:
+                df = load_result.dataframe
                 dataset_replaced = _sync_uploaded_dataset_state(
                     uploaded_file.name,
                     df,
@@ -142,22 +147,14 @@ def main() -> None:
                         "A different dataset was detected. Previous survival mapping, "
                         "annotations, and analysis selections were reset."
                     )
-                st.success("Dataset loaded successfully:")
-                st.markdown(
-                    "\n".join(
-                        [
-                            f"- File: {uploaded_file.name}",
-                            f"- Rows: {len(df)}",
-                            f"- Columns: {len(df.columns)}",
-                        ]
-                    )
-                )
+                st.success("Dataset loaded successfully.")
+                _render_dataset_summary(load_result.metadata, df)
 
                 st.subheader("Preview")
-                st.dataframe(df.head(20), width="stretch")
+                profile = st.session_state["profile_df"]
+                _render_dataset_preview(df, profile)
 
                 st.subheader("Column profile")
-                profile = st.session_state["profile_df"]
                 st.dataframe(profile, width="stretch")
 
                 st.subheader("Survival setup")
@@ -175,6 +172,91 @@ def main() -> None:
 
     with survival_tab:
         _render_survival_analysis_tab()
+
+
+def _render_dataset_summary(metadata: DatasetMetadata, df: pd.DataFrame) -> None:
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("File", metadata.file_name)
+    summary_columns[1].metric("Size", _format_file_size(metadata.file_size_bytes))
+    summary_columns[2].metric("Rows", len(df))
+    summary_columns[3].metric("Columns", len(df.columns))
+
+    delimiter = (
+        "Not applicable"
+        if metadata.format_name == "Excel"
+        else _format_delimiter(metadata.delimiter)
+    )
+    encoding = metadata.encoding or "Not applicable"
+    st.markdown(
+        f"**Detected format:** {metadata.format_name}  \n"
+        f"**Detected delimiter:** {delimiter}  \n"
+        f"**Detected encoding:** {encoding}"
+    )
+
+
+def _render_dataset_preview(df: pd.DataFrame, profile: pd.DataFrame) -> None:
+    initial_row_limit = 20
+    expanded_row_limit = 100
+    can_expand = len(df) > initial_row_limit
+    show_more = st.checkbox(
+        "Show more rows",
+        value=False,
+        key="show_more_preview_rows",
+        disabled=not can_expand,
+        help=f"Show up to {expanded_row_limit} rows instead of {initial_row_limit}.",
+    )
+    row_limit = expanded_row_limit if show_more and can_expand else initial_row_limit
+    preview, missing_mask = _prepare_dataset_preview(df, profile, row_limit)
+    styles = pd.DataFrame(
+        "",
+        index=preview.index,
+        columns=preview.columns,
+    )
+    styles[missing_mask] = "background-color: rgba(255, 75, 75, 0.25)"
+    styled_preview = preview.style.apply(lambda _: styles, axis=None)
+
+    st.dataframe(
+        styled_preview,
+        hide_index=True,
+        width="stretch",
+        height=min(800, 38 + 35 * max(len(preview), 1)),
+    )
+    st.caption(f"Showing {len(preview)} of {len(df)} rows. Column types appear in the headers.")
+    if bool(missing_mask.to_numpy().any()):
+        st.caption("Missing values are highlighted in red.")
+
+
+def _prepare_dataset_preview(
+    df: pd.DataFrame,
+    profile: pd.DataFrame,
+    row_limit: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    preview = df.head(max(0, row_limit)).copy(deep=True)
+    detected_types = profile["detected_type"].astype(str).tolist()
+    preview.columns = [
+        f"{column} · {detected_types[index] if index < len(detected_types) else 'unknown'}"
+        for index, column in enumerate(preview.columns)
+    ]
+    missing_mask = normalize_missing_values(preview).isna()
+    return preview, missing_mask
+
+
+def _format_file_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _format_delimiter(delimiter: str | None) -> str:
+    return {
+        None: "Not detected (single column)",
+        ",": "Comma (,)",
+        "\t": "Tab",
+        ";": "Semicolon (;)",
+        "|": "Pipe (|)",
+    }.get(delimiter, repr(delimiter))
 
 
 def _sync_uploaded_dataset_state(
