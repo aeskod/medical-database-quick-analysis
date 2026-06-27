@@ -200,3 +200,22 @@ def test_build_baseline_table_creates_overall_and_group_columns_with_labels():
     assert table.loc[table["Variable"] == "age", "Overall"].iloc[0] == "65 +/- 12.91; median 65 [57.50, 72.50]"
     assert table.loc[table["Variable"] == "stage = I", "Group 1"].iloc[0] == "1 (50.00%)"
     assert table.loc[table["Variable"] == "stage = Missing", "Group 2"].iloc[0] == "1 (50.00%)"
+
+
+def test_build_baseline_table_does_not_repeat_grouping_variable():
+    df = pd.DataFrame(
+        {
+            "sex": ["F", "M", "F", "M"],
+            "age": [50, 60, 70, 80],
+        }
+    )
+
+    table = build_baseline_table(
+        df,
+        continuous_vars=["age"],
+        categorical_vars=["sex"],
+        group_col="sex",
+    )
+
+    assert table["Variable"].tolist() == ["age"]
+    assert table.columns.tolist() == ["Variable", "Overall", "F", "M"]

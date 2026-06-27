@@ -38,6 +38,27 @@ def test_create_binary_event_series_can_treat_missing_as_censored():
     assert event_series.tolist() == [1, 0, 0]
 
 
+def test_create_binary_event_series_can_handle_unmapped_values_explicitly():
+    df = pd.DataFrame({"status": ["Dead", "Alive", "Unknown", "Pending"]})
+    censored_config = SurvivalConfig(
+        time_col="time",
+        event_col="status",
+        event_values=["Dead"],
+        censor_values=["Alive"],
+        unmapped_event_handling="treat_as_censored",
+    )
+    event_config = SurvivalConfig(
+        time_col="time",
+        event_col="status",
+        event_values=["Dead"],
+        censor_values=["Alive"],
+        unmapped_event_handling="treat_as_event",
+    )
+
+    assert create_binary_event_series(df, censored_config).tolist() == [1, 0, 0, 0]
+    assert create_binary_event_series(df, event_config).tolist() == [1, 0, 1, 1]
+
+
 def test_validate_survival_config_valid_mapping_returns_warnings_not_errors():
     df = pd.DataFrame(
         {
@@ -78,6 +99,43 @@ def test_validate_survival_config_reports_blocking_errors():
     assert any("negative" in error for error in errors)
     assert any("overlap" in error for error in errors)
     assert any("No patient ID column selected" in warning for warning in warnings)
+
+
+def test_validate_survival_config_rejects_invalid_unmapped_handling():
+    df = pd.DataFrame({"time": [1, 2], "status": [1, 0]})
+    config = SurvivalConfig(
+        time_col="time",
+        event_col="status",
+        event_values=[1],
+        censor_values=[0],
+        unmapped_event_handling="guess",
+    )
+
+    errors, _ = validate_survival_config(df, config)
+
+    assert any("Unmapped event handling" in error for error in errors)
+
+
+def test_validate_survival_config_describes_missing_and_unmapped_actions():
+    df = pd.DataFrame(
+        {
+            "time": [1, 2, 3, 4, 5, 6],
+            "status": ["Dead", "Alive", "Unknown", None, "Dead", "Alive"],
+        }
+    )
+    config = SurvivalConfig(
+        time_col="time",
+        event_col="status",
+        event_values=["Dead"],
+        censor_values=["Alive"],
+        missing_event_handling="treat_as_censored",
+        unmapped_event_handling="treat_as_event",
+    )
+
+    _, warnings = validate_survival_config(df, config)
+
+    assert any("missing values" in warning and "treated as censored" in warning for warning in warnings)
+    assert any("unmapped values" in warning and "treated as events" in warning for warning in warnings)
 
 
 def test_validate_survival_config_reports_no_usable_rows():

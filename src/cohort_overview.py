@@ -317,6 +317,8 @@ def build_baseline_table(
     group_value_labels: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     normalized = normalize_missing_values(df)
+    continuous_vars = [variable for variable in continuous_vars if variable != group_col]
+    categorical_vars = [variable for variable in categorical_vars if variable != group_col]
     group_values = _group_values(normalized, group_col)
     group_value_labels = group_value_labels or {}
     rows = []

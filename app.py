@@ -1,9 +1,33 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+from src.column_annotations import (
+    MEANING_OPTIONS,
+    USE_BASELINE,
+    USE_CHARTS,
+    USE_COLUMN_LABELS,
+    USE_COX,
+    USE_FILTER,
+    USE_GROUP,
+    USE_IGNORE,
+    annotations_from_dataframe,
+    annotations_to_dataframe,
+    apply_survival_roles,
+    build_default_annotations,
+    get_annotation_summary,
+    get_columns_for_use,
+    sync_annotations,
+)
+from src.charts import (
+    CHART_TYPE_LABELS,
+    CHART_TYPE_OPTIONS,
+    build_chart,
+    explain_chart_recommendation,
+    get_chart_variable_type,
+)
 from src.data_quality import (
     build_data_quality_report,
     determine_quality_status,
@@ -20,11 +44,21 @@ from src.profiling import normalize_missing_values, profile_dataframe
 from src.role_suggestions import suggest_survival_roles
 from src.survival_analysis import (
     combine_curve_results,
+    compute_group_survival_summary,
+    compute_number_at_risk_table,
+    compute_overall_survival_summary_table,
     fit_km_by_group,
     fit_km_overall,
+    format_p_value,
+    format_survival_time,
+    generate_survival_interpretation_warnings,
     get_survival_summary,
+    pivot_at_risk_table,
+    pivot_survival_probability_table,
+    run_logrank_test,
+    run_pairwise_logrank_tests,
     suggest_timepoints,
-    survival_probability_at_times,
+    survival_probability_table_by_group,
     validate_survival_ready_dataframe,
 )
 from src.survival_mapping import (
@@ -33,6 +67,43 @@ from src.survival_mapping import (
     validate_survival_config,
 )
 from src.survival_plots import plot_km_curve
+from src.upload_state import dataframe_content_digest, uploaded_file_content_digest
+
+
+DATASET_DERIVED_SESSION_KEYS = {
+    "survival_config",
+    "survival_ready_df",
+    "data_quality_report",
+    "cohort_group_col",
+    "cohort_continuous_vars",
+    "cohort_categorical_vars",
+    "chart_type_label",
+    "chart_x_col",
+    "chart_x_col_not_applicable",
+    "chart_y_col",
+    "chart_y_col_not_applicable",
+    "chart_color_col",
+    "chart_color_col_not_applicable",
+    "survival_analysis_group_col",
+    "group_value_labels",
+    "column_annotations",
+    "annotation_editor_version",
+    "annotation_status_message",
+}
+
+DATASET_DERIVED_SESSION_PREFIXES = (
+    "time_col_",
+    "event_col_",
+    "id_col_",
+    "group_col_",
+    "event_values_",
+    "censor_values_",
+    "unmapped_event_handling_",
+    "missing_event_handling_",
+    "time_unit_",
+    "survival_group_label_",
+    "column_annotation_editor_",
+)
 
 
 def main() -> None:
@@ -56,11 +127,21 @@ def main() -> None:
             st.info("Upload a CSV, TSV, or Excel file to begin.")
         else:
             try:
+                content_digest = uploaded_file_content_digest(uploaded_file)
                 df = read_dataset(uploaded_file)
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                _sync_uploaded_dataset_state(uploaded_file.name, df)
+                dataset_replaced = _sync_uploaded_dataset_state(
+                    uploaded_file.name,
+                    df,
+                    content_digest=content_digest,
+                )
+                if dataset_replaced:
+                    st.info(
+                        "A different dataset was detected. Previous survival mapping, "
+                        "annotations, and analysis selections were reset."
+                    )
                 st.success("Dataset loaded successfully:")
                 st.markdown(
                     "\n".join(
@@ -81,6 +162,7 @@ def main() -> None:
 
                 st.subheader("Survival setup")
                 _render_survival_setup(df, profile)
+                _render_column_annotations(df, profile)
 
     with data_quality_tab:
         _render_data_quality_tab()
@@ -89,27 +171,48 @@ def main() -> None:
         _render_cohort_overview_tab()
 
     with charts_tab:
-        st.info("Charts will be implemented in a later step.")
+        _render_charts_tab()
 
     with survival_tab:
         _render_survival_analysis_tab()
 
 
-def _sync_uploaded_dataset_state(file_name: str, df: pd.DataFrame) -> None:
-    dataset_signature = (file_name, len(df), len(df.columns), tuple(str(column) for column in df.columns))
+def _sync_uploaded_dataset_state(
+    file_name: str,
+    df: pd.DataFrame,
+    *,
+    content_digest: str | None = None,
+) -> bool:
+    """Synchronize upload state and report whether an existing dataset was replaced."""
+    del file_name  # A rename alone does not make identical content a new dataset.
+    resolved_digest = content_digest or dataframe_content_digest(df)
+    dataset_signature = f"sha256:{resolved_digest}"
     previous_signature = st.session_state.get("uploaded_dataset_signature")
+    dataset_changed = previous_signature != dataset_signature
+    dataset_replaced = previous_signature is not None and dataset_changed
 
-    if previous_signature != dataset_signature:
-        st.session_state.pop("survival_config", None)
-        st.session_state.pop("survival_ready_df", None)
-        st.session_state.pop("data_quality_report", None)
-        st.session_state.pop("cohort_group_col", None)
-        st.session_state.pop("cohort_continuous_vars", None)
-        st.session_state.pop("cohort_categorical_vars", None)
+    if dataset_changed:
+        _invalidate_dataset_derived_state()
 
     st.session_state["uploaded_dataset_signature"] = dataset_signature
     st.session_state["uploaded_df"] = df.copy(deep=True)
-    st.session_state["profile_df"] = profile_dataframe(df)
+    profile_df = profile_dataframe(df)
+    st.session_state["profile_df"] = profile_df
+    st.session_state["column_annotations"] = sync_annotations(
+        st.session_state.get("column_annotations"),
+        df,
+        profile_df,
+        st.session_state.get("survival_config"),
+    )
+    return dataset_replaced
+
+
+def _invalidate_dataset_derived_state() -> None:
+    for key in list(st.session_state):
+        if key in DATASET_DERIVED_SESSION_KEYS or key.startswith(
+            DATASET_DERIVED_SESSION_PREFIXES
+        ):
+            st.session_state.pop(key, None)
 
 
 def _render_data_quality_tab() -> None:
@@ -259,6 +362,18 @@ def _render_survival_quality_section(report: dict[str, Any]) -> None:
             {"Metric": "Events", "Value": survival_quality["events"]},
             {"Metric": "Censored", "Value": survival_quality["censored"]},
             {"Metric": "Event rate", "Value": f"{survival_quality['event_rate']}%"},
+            {
+                "Metric": "Unmapped value handling",
+                "Value": _format_event_handling(
+                    survival_quality["unmapped_event_handling"]
+                ),
+            },
+            {
+                "Metric": "Missing event handling",
+                "Value": _format_event_handling(
+                    survival_quality["missing_event_handling"]
+                ),
+            },
             {"Metric": "Missing time values", "Value": survival_quality["time_missing_count"]},
             {"Metric": "Missing event values", "Value": survival_quality["event_missing_count"]},
             {"Metric": "Negative time values", "Value": survival_quality["negative_time_count"]},
@@ -308,6 +423,7 @@ def _render_cohort_overview_tab() -> None:
     profile_df = st.session_state.get("profile_df")
     survival_config = st.session_state.get("survival_config")
     survival_ready_df = st.session_state.get("survival_ready_df")
+    annotations = st.session_state.get("column_annotations")
 
     if uploaded_df is None:
         st.info("No dataset uploaded yet.\n\nUpload a dataset first to view cohort summaries.")
@@ -319,7 +435,12 @@ def _render_cohort_overview_tab() -> None:
         survival_ready_df=survival_ready_df,
         time_unit=time_unit,
     )
-    default_variables = get_default_baseline_variables(uploaded_df, profile_df, survival_config)
+    inferred_variables = get_default_baseline_variables(uploaded_df, profile_df, survival_config)
+    default_variables = _annotated_baseline_variables(
+        uploaded_df,
+        inferred_variables,
+        annotations,
+    )
     variable_type_summary = count_variable_types(uploaded_df, profile_df, survival_config)
 
     _render_cohort_summary_cards(metrics)
@@ -329,9 +450,12 @@ def _render_cohort_overview_tab() -> None:
     st.dataframe(variable_type_summary, hide_index=True, width="stretch")
 
     st.subheader("Variables to include")
-    group_col = _render_cohort_group_selector(uploaded_df, default_variables, survival_config)
-    continuous_vars, categorical_vars, max_levels, include_missing = _render_baseline_table_controls(
+    group_col = _render_cohort_group_selector(
         uploaded_df,
+        annotations,
+        survival_config,
+    )
+    continuous_vars, categorical_vars, max_levels, include_missing = _render_baseline_table_controls(
         default_variables,
     )
 
@@ -342,6 +466,15 @@ def _render_cohort_overview_tab() -> None:
             + ", ".join(overlapping_vars)
         )
         continuous_vars = [column for column in continuous_vars if column not in overlapping_vars]
+
+    if group_col is not None and (
+        group_col in continuous_vars or group_col in categorical_vars
+    ):
+        st.caption(
+            f"`{group_col}` defines the Table 1 columns and is not repeated as a characteristic."
+        )
+        continuous_vars = [column for column in continuous_vars if column != group_col]
+        categorical_vars = [column for column in categorical_vars if column != group_col]
 
     st.subheader("Baseline characteristics")
     if not continuous_vars and not categorical_vars:
@@ -411,6 +544,18 @@ def _render_cohort_mapping_summary(survival_config: SurvivalConfig | None) -> No
                 "Field": "censored values",
                 "Value": ", ".join(_format_value(value) for value in survival_config.censor_values),
             },
+            {
+                "Field": "unmapped values",
+                "Value": _format_event_handling(
+                    getattr(survival_config, "unmapped_event_handling", "exclude")
+                ),
+            },
+            {
+                "Field": "missing event values",
+                "Value": _format_event_handling(
+                    survival_config.missing_event_handling
+                ),
+            },
             {"Field": "group", "Value": survival_config.group_col or "None"},
             {"Field": "time unit", "Value": survival_config.time_unit},
         ]
@@ -420,21 +565,12 @@ def _render_cohort_mapping_summary(survival_config: SurvivalConfig | None) -> No
 
 def _render_cohort_group_selector(
     df: pd.DataFrame,
-    default_variables: dict[str, list[str]],
+    annotations: Any,
     survival_config: SurvivalConfig | None,
 ) -> str | None:
     all_columns = [str(column) for column in df.columns]
-    categorical_columns = [
-        column
-        for column in default_variables.get("categorical", [])
-        if column in all_columns
-    ]
-    remaining_columns = [
-        column
-        for column in all_columns
-        if column not in categorical_columns
-    ]
-    options = ["No grouping"] + categorical_columns + remaining_columns
+    group_columns = get_columns_for_use(annotations, USE_GROUP, all_columns)
+    options = ["No grouping"] + group_columns
     default_group = getattr(survival_config, "group_col", None) if survival_config is not None else None
     default_option = default_group if default_group in options else "No grouping"
 
@@ -444,17 +580,22 @@ def _render_cohort_group_selector(
     selected = st.selectbox(
         "Group by",
         options,
-        index=options.index(st.session_state["cohort_group_col"]),
         key="cohort_group_col",
     )
+    if not group_columns:
+        st.caption("No columns are annotated for grouping. Update Column annotations on Upload.")
     return None if selected == "No grouping" else str(selected)
 
 
 def _render_baseline_table_controls(
-    df: pd.DataFrame,
     default_variables: dict[str, list[str]],
 ) -> tuple[list[str], list[str], int, bool]:
-    all_columns = [str(column) for column in df.columns]
+    all_columns = list(
+        dict.fromkeys(
+            default_variables.get("continuous", [])
+            + default_variables.get("categorical", [])
+        )
+    )
     continuous_default = [
         column
         for column in default_variables.get("continuous", [])
@@ -481,6 +622,11 @@ def _render_baseline_table_controls(
         default=categorical_default,
         key="cohort_categorical_vars",
     )
+    if not all_columns:
+        st.caption(
+            "No columns are annotated for the baseline table. "
+            "Update Column annotations on Upload."
+        )
 
     control_row = st.columns(2)
     max_levels = int(
@@ -494,6 +640,26 @@ def _render_baseline_table_controls(
     include_missing = bool(control_row[1].checkbox("Include missing rows", value=True))
 
     return list(continuous_vars), list(categorical_vars), max_levels, include_missing
+
+
+def _annotated_baseline_variables(
+    df: pd.DataFrame,
+    inferred_variables: dict[str, list[str]],
+    annotations: Any,
+) -> dict[str, list[str]]:
+    selected = get_columns_for_use(annotations, USE_BASELINE, df.columns)
+    inferred_continuous = set(inferred_variables.get("continuous", []))
+    continuous = [column for column in selected if column in inferred_continuous]
+    categorical = [column for column in selected if column not in inferred_continuous]
+    return {
+        "continuous": continuous,
+        "categorical": categorical,
+        "excluded": [
+            str(column)
+            for column in df.columns
+            if str(column) not in selected
+        ],
+    }
 
 
 def _sanitize_multiselect_state(key: str, valid_options: list[str]) -> None:
@@ -530,11 +696,216 @@ def _metric_value(value: Any) -> Any:
     return value
 
 
+def _render_charts_tab() -> None:
+    st.subheader("Charts")
+
+    uploaded_df = st.session_state.get("uploaded_df")
+    profile_df = st.session_state.get("profile_df")
+    annotations = st.session_state.get("column_annotations")
+
+    if uploaded_df is None:
+        st.info("No dataset uploaded yet.\n\nUpload a dataset first to create charts.")
+        return
+
+    all_columns = get_columns_for_use(
+        annotations,
+        USE_CHARTS,
+        uploaded_df.columns,
+    )
+    if not all_columns:
+        st.warning(
+            "No columns are annotated for charts. "
+            "Update Column annotations on Upload."
+        )
+        return
+
+    chart_df = uploaded_df.loc[:, all_columns]
+    variable_types = {
+        column: get_chart_variable_type(column, chart_df, profile_df)
+        for column in all_columns
+    }
+    chartable_variables = [
+        column
+        for column, variable_type in variable_types.items()
+        if variable_type in {"numeric", "categorical"}
+    ]
+    if not chartable_variables:
+        st.warning("No chartable variables found.")
+
+    variable_options = ["None"] + all_columns
+    chart_type_labels = list(CHART_TYPE_OPTIONS.keys())
+    _set_default_session_value("chart_type_label", "Auto", chart_type_labels)
+    _set_default_session_value(
+        "chart_x_col",
+        _default_chart_x_column(variable_types) or "None",
+        variable_options,
+    )
+    _set_default_session_value("chart_y_col", "None", variable_options)
+    _set_default_session_value("chart_color_col", "None", variable_options)
+
+    control_row = st.columns(2)
+    chart_type_label = control_row[0].selectbox(
+        "Chart type",
+        chart_type_labels,
+        key="chart_type_label",
+    )
+    chart_type = CHART_TYPE_OPTIONS[chart_type_label]
+    axis_controls_disabled = chart_type in {"correlation_heatmap", "missingness_bar"}
+    if axis_controls_disabled:
+        x_choice = control_row[1].selectbox(
+            "X variable",
+            ["N/A"],
+            key="chart_x_col_not_applicable",
+            disabled=True,
+        )
+    else:
+        x_choice = control_row[1].selectbox(
+            "X variable",
+            variable_options,
+            key="chart_x_col",
+        )
+
+    variable_row = st.columns(2)
+    if axis_controls_disabled:
+        y_choice = variable_row[0].selectbox(
+            "Y variable",
+            ["N/A"],
+            key="chart_y_col_not_applicable",
+            disabled=True,
+        )
+        color_choice = variable_row[1].selectbox(
+            "Color/group variable",
+            ["N/A"],
+            key="chart_color_col_not_applicable",
+            disabled=True,
+        )
+    else:
+        y_choice = variable_row[0].selectbox(
+            "Y variable",
+            variable_options,
+            key="chart_y_col",
+        )
+        color_choice = variable_row[1].selectbox(
+            "Color/group variable",
+            variable_options,
+            key="chart_color_col",
+        )
+    if axis_controls_disabled:
+        st.caption(f"{chart_type_label} uses the full dataset, so X, Y, and color variables are disabled.")
+
+    option_row = st.columns(3)
+    max_category_levels = int(
+        option_row[0].slider(
+            "Maximum categorical levels",
+            min_value=3,
+            max_value=50,
+            value=20,
+        )
+    )
+    include_missing = bool(
+        option_row[1].checkbox(
+            "Include missing values in categorical charts",
+            value=True,
+        )
+    )
+    normalize = bool(
+        option_row[2].checkbox(
+            "Normalize stacked bar chart to percentages",
+            value=False,
+        )
+    )
+
+    x_col = None if axis_controls_disabled else _none_option_to_value(x_choice)
+    y_col = None if axis_controls_disabled else _none_option_to_value(y_choice)
+    color_col = None if axis_controls_disabled else _none_option_to_value(color_choice)
+
+    result = build_chart(
+        chart_df,
+        chart_type=chart_type,
+        x_col=x_col,
+        y_col=y_col,
+        color_col=color_col,
+        profile_df=profile_df,
+        max_category_levels=max_category_levels,
+        include_missing=include_missing,
+        normalize=normalize,
+    )
+
+    resolved_chart_type = result["chart_type"]
+    if chart_type == "auto":
+        st.info(
+            f"Suggested chart: {CHART_TYPE_LABELS.get(resolved_chart_type, resolved_chart_type)}\n\n"
+            f"Reason: {explain_chart_recommendation(resolved_chart_type, x_col, y_col, chart_df, profile_df)}"
+        )
+
+    _render_chart_survival_mapping_note(
+        [x_col, y_col, color_col],
+        st.session_state.get("survival_config"),
+    )
+
+    for warning in result["warnings"]:
+        st.warning(warning)
+
+    fig = result["fig"]
+    if fig is None:
+        st.warning("Select compatible variables to create a chart.")
+        return
+
+    st.plotly_chart(fig, width="stretch")
+    st.download_button(
+        "Download chart as HTML",
+        data=fig.to_html(include_plotlyjs="cdn"),
+        file_name="chart.html",
+        mime="text/html",
+    )
+
+
+def _default_chart_x_column(variable_types: dict[str, str]) -> str | None:
+    for variable_type in ["numeric", "categorical"]:
+        for column, detected_type in variable_types.items():
+            if detected_type == variable_type:
+                return column
+    return None
+
+
+def _set_default_session_value(key: str, default_value: str, valid_options: list[str]) -> None:
+    if st.session_state.get(key) not in valid_options:
+        st.session_state[key] = default_value if default_value in valid_options else valid_options[0]
+
+
+def _none_option_to_value(value: str) -> str | None:
+    return None if value == "None" else value
+
+
+def _render_chart_survival_mapping_note(
+    selected_columns: list[str | None],
+    survival_config: SurvivalConfig | None,
+) -> None:
+    if survival_config is None:
+        return
+
+    survival_roles = {
+        survival_config.time_col: "time",
+        survival_config.event_col: "event",
+        survival_config.id_col: "patient ID",
+        survival_config.group_col: "group",
+    }
+    selected_survival_columns = [
+        f"{column} ({survival_roles[column]})"
+        for column in selected_columns
+        if column is not None and column in survival_roles and survival_roles[column] is not None
+    ]
+    if selected_survival_columns:
+        st.info("Selected variable is used in survival mapping: " + ", ".join(selected_survival_columns))
+
+
 def _render_survival_analysis_tab() -> None:
     st.subheader("Survival Analysis")
 
     config = st.session_state.get("survival_config")
     survival_ready_df = st.session_state.get("survival_ready_df")
+    uploaded_df = st.session_state.get("uploaded_df")
+    annotations = st.session_state.get("column_annotations")
 
     if config is None or survival_ready_df is None:
         st.info(
@@ -545,10 +916,7 @@ def _render_survival_analysis_tab() -> None:
 
     _render_current_mapping(config)
 
-    errors, warnings = validate_survival_ready_dataframe(survival_ready_df)
-    for warning in warnings:
-        st.warning(warning)
-
+    errors, validation_warnings = validate_survival_ready_dataframe(survival_ready_df)
     if errors:
         st.error("Survival analysis cannot be run because:")
         for error in errors:
@@ -557,32 +925,93 @@ def _render_survival_analysis_tab() -> None:
 
     st.success("Survival-ready data validated.")
 
+    st.markdown("**Plot controls**")
+    show_ci = st.checkbox("Show confidence interval", value=True)
+    group_columns = get_columns_for_use(
+        annotations,
+        USE_GROUP,
+        uploaded_df.columns if uploaded_df is not None else [],
+    )
+    group_options = ["No grouping"] + group_columns
+    default_group = config.group_col if config.group_col in group_columns else "No grouping"
+    _set_default_session_value(
+        "survival_analysis_group_col",
+        default_group,
+        group_options,
+    )
+    selected_group_option = st.selectbox(
+        "Group / stratification variable",
+        group_options,
+        key="survival_analysis_group_col",
+    )
+    analysis_group_col = (
+        None if selected_group_option == "No grouping" else str(selected_group_option)
+    )
+    survival_ready_df = _survival_dataframe_for_group(
+        uploaded_df,
+        config,
+        survival_ready_df,
+        analysis_group_col,
+    )
+    has_group = analysis_group_col is not None and "_group" in survival_ready_df.columns
+    use_group = has_group
+    if not group_columns:
+        st.caption("No columns are annotated for grouping. Update Column annotations on Upload.")
+
     summary = get_survival_summary(survival_ready_df, config.time_unit)
     overall_result = fit_km_overall(survival_ready_df)
+
+    group_value_labels = st.session_state.get("group_value_labels")
+    if use_group and has_group and analysis_group_col is not None:
+        _render_survival_group_label_editor(survival_ready_df, analysis_group_col)
+        group_value_labels = st.session_state.get("group_value_labels")
+
+    plot_results = [overall_result]
+    plot_title = "Kaplan-Meier Survival Curve"
+    group_warnings: list[str] = []
+    group_results: list[dict[str, Any]] = []
+
+    if use_group and has_group:
+        group_results, group_warnings = fit_km_by_group(
+            survival_ready_df,
+            group_value_labels=group_value_labels,
+            original_group_col=analysis_group_col,
+        )
+        if group_results:
+            plot_results = group_results
+            plot_title = "Grouped Kaplan-Meier Survival Curve"
+
+    logrank_result = run_logrank_test(survival_ready_df) if use_group and has_group else None
+    logrank_warnings = logrank_result.get("warnings", []) if logrank_result is not None else []
+    interpretation_warnings = generate_survival_interpretation_warnings(
+        survival_ready_df,
+        group_col="_group" if use_group and has_group else None,
+    )
+    _render_survival_warning_section(
+        validation_warnings
+        + group_warnings
+        + interpretation_warnings
+        + list(logrank_warnings)
+    )
+
     _render_survival_summary_metrics(
         summary,
         overall_result["median_survival"],
         config.time_unit,
     )
 
-    st.markdown("**Plot controls**")
-    show_ci = st.checkbox("Show confidence interval", value=True)
-    has_group = "_group" in survival_ready_df.columns
-    use_group = st.checkbox(
-        "Use grouping column if available",
-        value=has_group,
-        disabled=not has_group,
+    overall_summary_table = compute_overall_survival_summary_table(survival_ready_df, config.time_unit)
+    st.subheader("Overall survival summary")
+    st.dataframe(
+        _format_survival_summary_display_table(overall_summary_table, config.time_unit),
+        hide_index=True,
+        width="stretch",
     )
-
-    plot_results = [overall_result]
-    plot_title = "Kaplan-Meier Survival Curve"
-    group_warnings: list[str] = []
-
-    if use_group and has_group:
-        group_results, group_warnings = fit_km_by_group(survival_ready_df)
-        if group_results:
-            plot_results = group_results
-            plot_title = "Grouped Kaplan-Meier Survival Curve"
+    _render_dataframe_download(
+        "Download overall survival summary as CSV",
+        overall_summary_table,
+        "overall_survival_summary.csv",
+    )
 
     curve_df = combine_curve_results(plot_results)
     fig = plot_km_curve(
@@ -593,10 +1022,51 @@ def _render_survival_analysis_tab() -> None:
     )
     st.plotly_chart(fig, width="stretch")
 
-    for warning in group_warnings:
-        st.warning(warning)
+    if use_group and has_group:
+        st.subheader("Group-wise survival summary")
+        group_summary = compute_group_survival_summary(
+            survival_ready_df,
+            time_unit=config.time_unit,
+            group_value_labels=group_value_labels,
+            original_group_col=analysis_group_col,
+        )
+        if group_summary.empty:
+            st.info("Grouped summary is unavailable because no grouping column was selected.")
+        else:
+            st.dataframe(
+                _format_survival_summary_display_table(group_summary, config.time_unit),
+                hide_index=True,
+                width="stretch",
+            )
+            _render_dataframe_download(
+                "Download group-wise survival summary as CSV",
+                group_summary,
+                "group_survival_summary.csv",
+            )
+    else:
+        st.info("Grouped summary is unavailable because no grouping column was selected.")
 
-    st.subheader("Survival probability at selected times")
+    if use_group and has_group and logrank_result is not None:
+        _render_logrank_section(logrank_result)
+
+        pairwise_df = run_pairwise_logrank_tests(
+            survival_ready_df,
+            group_value_labels=group_value_labels,
+            original_group_col=analysis_group_col,
+        )
+        if not pairwise_df.empty:
+            st.subheader("Pairwise log-rank tests")
+            st.warning(
+                "Pairwise tests are exploratory and are not adjusted for multiple comparisons in this version."
+            )
+            st.dataframe(pairwise_df, hide_index=True, width="stretch")
+            _render_dataframe_download(
+                "Download pairwise log-rank tests as CSV",
+                pairwise_df,
+                "pairwise_logrank_tests.csv",
+            )
+
+    st.subheader("Selected time points")
     suggested_timepoints = suggest_timepoints(summary["max_followup"], config.time_unit)
     default_timepoint_text = ", ".join(_format_number(timepoint) for timepoint in suggested_timepoints)
     timepoint_text = st.text_input("Time points", default_timepoint_text)
@@ -609,8 +1079,59 @@ def _render_survival_analysis_tab() -> None:
         st.info("No time points are available for this follow-up range.")
         return
 
-    probability_df = survival_probability_at_times(overall_result["kmf"], timepoints)
-    st.dataframe(probability_df, width="stretch")
+    st.subheader("Number at risk")
+    overall_at_risk = compute_number_at_risk_table(survival_ready_df, timepoints, group_col=None)
+    if use_group and has_group:
+        group_at_risk = compute_number_at_risk_table(
+            survival_ready_df,
+            timepoints,
+            group_col="_group",
+            group_value_labels=group_value_labels,
+            original_group_col=analysis_group_col,
+        )
+        at_risk_df = pd.concat([overall_at_risk, group_at_risk], ignore_index=True)
+    else:
+        at_risk_df = overall_at_risk
+
+    st.dataframe(pivot_at_risk_table(at_risk_df), hide_index=True, width="stretch")
+    _render_dataframe_download(
+        "Download number-at-risk table as CSV",
+        at_risk_df,
+        "number_at_risk.csv",
+    )
+
+    st.subheader("Survival probability at selected time points")
+    probability_results = (
+        [overall_result] + group_results
+        if use_group and has_group and group_results
+        else [overall_result]
+    )
+    probability_df = survival_probability_table_by_group(probability_results, timepoints)
+    st.dataframe(pivot_survival_probability_table(probability_df), hide_index=True, width="stretch")
+    _render_dataframe_download(
+        "Download survival probabilities as CSV",
+        probability_df,
+        "survival_probabilities.csv",
+    )
+
+
+def _survival_dataframe_for_group(
+    uploaded_df: pd.DataFrame | None,
+    config: SurvivalConfig,
+    stored_survival_df: pd.DataFrame,
+    group_col: str | None,
+) -> pd.DataFrame:
+    if group_col is None:
+        return stored_survival_df.drop(columns=["_group"], errors="ignore").copy(deep=True)
+
+    if group_col == config.group_col and "_group" in stored_survival_df.columns:
+        return stored_survival_df.copy(deep=True)
+
+    if uploaded_df is None or group_col not in uploaded_df.columns:
+        return stored_survival_df.drop(columns=["_group"], errors="ignore").copy(deep=True)
+
+    analysis_config = replace(config, group_col=group_col)
+    return create_survival_ready_dataframe(uploaded_df, analysis_config)
 
 
 def _render_current_mapping(config: SurvivalConfig) -> None:
@@ -621,6 +1142,16 @@ def _render_current_mapping(config: SurvivalConfig) -> None:
             {"Field": "Event column", "Value": config.event_col},
             {"Field": "Event values", "Value": ", ".join(_format_value(value) for value in config.event_values)},
             {"Field": "Censor values", "Value": ", ".join(_format_value(value) for value in config.censor_values)},
+            {
+                "Field": "Unmapped values",
+                "Value": _format_event_handling(
+                    getattr(config, "unmapped_event_handling", "exclude")
+                ),
+            },
+            {
+                "Field": "Missing event values",
+                "Value": _format_event_handling(config.missing_event_handling),
+            },
             {"Field": "Patient ID column", "Value": config.id_col or "Row number"},
             {"Field": "Group column", "Value": config.group_col or "None"},
             {"Field": "Time unit", "Value": config.time_unit},
@@ -643,7 +1174,114 @@ def _render_survival_summary_metrics(
     second_row = st.columns(3)
     second_row[0].metric("Median follow-up", _format_time_value(summary["median_followup"], time_unit))
     second_row[1].metric("Max follow-up", _format_time_value(summary["max_followup"], time_unit))
-    second_row[2].metric("Median survival", _format_time_value(median_survival, time_unit, not_reached=True))
+    second_row[2].metric("Median survival", format_survival_time(median_survival, time_unit))
+
+
+def _render_survival_group_label_editor(survival_ready_df: pd.DataFrame, group_col: str) -> None:
+    if "_group" not in survival_ready_df.columns:
+        return
+
+    raw_group_values = sorted(
+        [value for value in survival_ready_df["_group"].dropna().unique()],
+        key=lambda value: str(value),
+    )
+    if not raw_group_values:
+        return
+
+    all_labels = st.session_state.get("group_value_labels")
+    if not isinstance(all_labels, dict):
+        all_labels = {}
+
+    existing_column_labels = all_labels.get(group_col, {})
+    if not isinstance(existing_column_labels, dict):
+        existing_column_labels = {}
+
+    updated_column_labels = {}
+    with st.expander("Group value labels"):
+        for raw_value in raw_group_values:
+            raw_key = str(raw_value)
+            entered_label = st.text_input(
+                f"Raw value: {raw_key}",
+                value=str(existing_column_labels.get(raw_key, "")),
+                key=f"survival_group_label_{group_col}_{raw_key}",
+            )
+            if entered_label.strip():
+                updated_column_labels[raw_key] = entered_label.strip()
+
+    if updated_column_labels:
+        all_labels[group_col] = updated_column_labels
+    else:
+        all_labels.pop(group_col, None)
+    st.session_state["group_value_labels"] = all_labels
+
+
+def _render_survival_warning_section(warnings: list[str]) -> None:
+    st.subheader("Survival analysis warnings")
+    unique_warnings = _unique_messages(warnings)
+    if not unique_warnings:
+        st.success("No major survival-analysis warnings detected.")
+        return
+
+    for warning in unique_warnings:
+        st.warning(warning)
+
+
+def _render_logrank_section(logrank_result: dict[str, Any]) -> None:
+    st.subheader("Log-rank test")
+    st.caption("The log-rank test compares survival curves between groups. It does not adjust for other variables.")
+
+    if not logrank_result.get("available"):
+        st.info(str(logrank_result.get("reason", "Log-rank test is unavailable.")))
+        return
+
+    columns = st.columns(4)
+    columns[0].metric("Test statistic", f"{float(logrank_result['test_statistic']):.2f}")
+    columns[1].metric("p-value", format_p_value(logrank_result["p_value"]))
+    columns[2].metric("Degrees of freedom", logrank_result["degrees_of_freedom"])
+    columns[3].metric("Groups", logrank_result["n_groups"])
+
+
+def _format_survival_summary_display_table(summary_df: pd.DataFrame, time_unit: str) -> pd.DataFrame:
+    if summary_df.empty:
+        return summary_df
+
+    display_df = summary_df.copy(deep=True)
+    if "event_rate" in display_df.columns:
+        display_df["event_rate"] = display_df["event_rate"].apply(lambda value: f"{float(value):.2f}%")
+
+    for column in ["median_followup", "max_followup"]:
+        if column in display_df.columns:
+            display_df[column] = display_df[column].apply(lambda value: _format_time_value(value, time_unit))
+
+    if "median_survival" in display_df.columns:
+        display_df["median_survival"] = display_df["median_survival"].apply(
+            lambda value: format_survival_time(value, time_unit)
+        )
+
+    return display_df
+
+
+def _render_dataframe_download(label: str, df: pd.DataFrame, file_name: str) -> None:
+    if df.empty:
+        return
+
+    st.download_button(
+        label,
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=file_name,
+        mime="text/csv",
+    )
+
+
+def _unique_messages(messages: list[str]) -> list[str]:
+    seen = set()
+    unique = []
+    for message in messages:
+        if message in seen:
+            continue
+        seen.add(message)
+        unique.append(message)
+    return unique
 
 
 def _parse_timepoints(
@@ -706,9 +1344,15 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
     event_values: list[Any] = []
     censor_values: list[Any] = []
     missing_event_handling = "exclude"
+    unmapped_event_handling = "exclude"
 
     if event_col:
-        event_values, censor_values, missing_event_handling = _render_event_value_mapping(df, event_col)
+        (
+            event_values,
+            censor_values,
+            missing_event_handling,
+            unmapped_event_handling,
+        ) = _render_event_value_mapping(df, event_col)
 
     id_col = _select_optional_role_column(
         "Patient ID column",
@@ -738,6 +1382,7 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
             group_col=group_col,
             time_unit=time_unit,
             missing_event_handling=missing_event_handling,
+            unmapped_event_handling=unmapped_event_handling,
         )
         errors, warnings = validate_survival_config(df, config)
 
@@ -752,6 +1397,19 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
         survival_ready_df = create_survival_ready_dataframe(df, config)
         st.session_state["survival_config"] = config
         st.session_state["survival_ready_df"] = survival_ready_df
+        st.session_state["column_annotations"] = apply_survival_roles(
+            sync_annotations(
+                st.session_state.get("column_annotations"),
+                df,
+                profile,
+                config,
+            ),
+            config,
+            seed_analysis_uses=True,
+        )
+        st.session_state["annotation_editor_version"] = (
+            int(st.session_state.get("annotation_editor_version", 0)) + 1
+        )
 
         event_count = int((survival_ready_df["_event"] == 1).sum())
         censored_count = int((survival_ready_df["_event"] == 0).sum())
@@ -762,6 +1420,114 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
             f"Censored: {censored_count}"
         )
         st.json(_json_safe_config(config))
+
+
+def _render_column_annotations(df: pd.DataFrame, profile: pd.DataFrame) -> None:
+    st.subheader("Column annotations")
+    config = st.session_state.get("survival_config")
+    if config is None:
+        st.info("Confirm the survival mapping to annotate how every column should be used.")
+        return
+
+    annotations = sync_annotations(
+        st.session_state.get("column_annotations"),
+        df,
+        profile,
+        config,
+    )
+    st.session_state["column_annotations"] = annotations
+
+    st.caption(
+        "Meaning describes what a column represents. Analysis uses are independent, so a column "
+        "can be available for filters, grouping, the baseline table, Cox modeling, and charts."
+    )
+    editor_df = annotations_to_dataframe(annotations, profile)
+    editor_version = int(st.session_state.get("annotation_editor_version", 0))
+
+    with st.form(f"column_annotation_form_{editor_version}"):
+        edited_df = st.data_editor(
+            editor_df,
+            hide_index=True,
+            width="stretch",
+            height=min(800, 38 + 35 * max(len(editor_df), 1)),
+            disabled=["Column", "Type", "Missing %", "Example values"],
+            column_config={
+                "Column": st.column_config.TextColumn("Column"),
+                "Type": st.column_config.TextColumn("Detected type"),
+                "Missing %": st.column_config.NumberColumn("Missing %", format="%.2f"),
+                "Example values": st.column_config.TextColumn("Example values"),
+                "Meaning": st.column_config.SelectboxColumn(
+                    "Meaning",
+                    options=MEANING_OPTIONS,
+                    required=True,
+                ),
+                "Custom meaning": st.column_config.TextColumn(
+                    "Custom meaning",
+                    help="Required only when Meaning is Custom...",
+                ),
+                **{
+                    label: st.column_config.CheckboxColumn(label)
+                    for label in USE_COLUMN_LABELS.values()
+                },
+            },
+            key=f"column_annotation_editor_{editor_version}",
+        )
+        save_annotations = st.form_submit_button(
+            "Save annotations",
+            type="primary",
+        )
+        reset_annotations = st.form_submit_button("Reset to suggested annotations")
+
+    if save_annotations:
+        try:
+            parsed_annotations = annotations_from_dataframe(edited_df, df.columns)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["column_annotations"] = sync_annotations(
+                parsed_annotations,
+                df,
+                profile,
+                config,
+            )
+            _invalidate_annotation_consumer_state()
+            st.session_state["annotation_editor_version"] = editor_version + 1
+            st.session_state["annotation_status_message"] = "Column annotations saved."
+            st.rerun()
+
+    if reset_annotations:
+        st.session_state["column_annotations"] = build_default_annotations(df, profile, config)
+        _invalidate_annotation_consumer_state()
+        st.session_state["annotation_editor_version"] = editor_version + 1
+        st.session_state["annotation_status_message"] = "Suggested annotations restored."
+        st.rerun()
+
+    status_message = st.session_state.pop("annotation_status_message", None)
+    if status_message:
+        st.success(status_message)
+
+    summary = get_annotation_summary(st.session_state["column_annotations"])
+    summary_columns = st.columns(6)
+    summary_columns[0].metric("Filters", summary[USE_FILTER])
+    summary_columns[1].metric("Groups", summary[USE_GROUP])
+    summary_columns[2].metric("Baseline", summary[USE_BASELINE])
+    summary_columns[3].metric("Cox", summary[USE_COX])
+    summary_columns[4].metric("Charts", summary[USE_CHARTS])
+    summary_columns[5].metric("Ignored", summary[USE_IGNORE])
+    st.caption("Cox covariate annotations are stored now and will be used when Cox modeling is added.")
+
+
+def _invalidate_annotation_consumer_state() -> None:
+    for key in [
+        "cohort_group_col",
+        "cohort_continuous_vars",
+        "cohort_categorical_vars",
+        "chart_x_col",
+        "chart_y_col",
+        "chart_color_col",
+        "survival_analysis_group_col",
+    ]:
+        st.session_state.pop(key, None)
 
 
 def _select_required_role_column(
@@ -879,13 +1645,13 @@ def _candidate_by_column(column_name: str, candidates: list[dict[str, Any]]) -> 
 def _render_event_value_mapping(
     df: pd.DataFrame,
     event_col: str,
-) -> tuple[list[Any], list[Any], str]:
+) -> tuple[list[Any], list[Any], str, str]:
     unique_values = _unique_non_missing_values(df, event_col)
     st.markdown(f"Values found in `{event_col}`:")
 
     if not unique_values:
         st.caption("No non-missing values found.")
-        return [], [], "exclude"
+        return [], [], "exclude", "exclude"
 
     st.caption(", ".join(_format_value(value) for value in unique_values))
 
@@ -897,26 +1663,68 @@ def _render_event_value_mapping(
         format_func=_format_value,
         key=f"event_values_{event_col}",
     )
-    event_keys = {_canonical_value(value) for value in event_values}
-    default_censor_values = [
-        value for value in unique_values if _canonical_value(value) not in event_keys
-    ]
+    default_censor_values = _default_censor_values(
+        unique_values,
+        event_values,
+    )
     censor_values = st.multiselect(
-        "Censored values",
+        "Which value(s) explicitly mean censored?",
         unique_values,
         default=default_censor_values,
         format_func=_format_value,
         key=f"censor_values_{event_col}",
     )
+
+    mapped_keys = {
+        _canonical_value(value)
+        for value in list(event_values) + list(censor_values)
+    }
+    unmapped_values = [
+        value
+        for value in unique_values
+        if _canonical_value(value) not in mapped_keys
+    ]
+    if unmapped_values:
+        st.warning(
+            "Currently unmapped: "
+            + ", ".join(_format_value(value) for value in unmapped_values)
+        )
+    else:
+        st.caption("All non-missing values are explicitly mapped.")
+
+    unmapped_choice = st.radio(
+        "Unmapped non-missing values",
+        [
+            "Exclude from survival analysis",
+            "Treat as censored",
+            "Treat as events",
+        ],
+        index=0,
+        key=f"unmapped_event_handling_{event_col}",
+        help=(
+            "Exclusion is the conservative default. Treating unknown values as censored "
+            "or as events can materially change survival estimates."
+        ),
+    )
+    unmapped_event_handling = {
+        "Treat as censored": "treat_as_censored",
+        "Treat as events": "treat_as_event",
+    }.get(unmapped_choice, "exclude")
+
     missing_choice = st.radio(
-        "Missing values",
+        "Missing event values",
         ["Exclude from survival analysis", "Treat as censored"],
         index=0,
         key=f"missing_event_handling_{event_col}",
     )
     missing_event_handling = "treat_as_censored" if missing_choice == "Treat as censored" else "exclude"
 
-    return event_values, censor_values, missing_event_handling
+    return (
+        event_values,
+        censor_values,
+        missing_event_handling,
+        unmapped_event_handling,
+    )
 
 
 def _render_time_unit_selector(time_col: str) -> str:
@@ -973,6 +1781,50 @@ def _default_event_values(unique_values: list[Any]) -> list[Any]:
     return []
 
 
+def _default_censor_values(
+    unique_values: list[Any],
+    event_values: list[Any],
+) -> list[Any]:
+    event_keys = {_canonical_value(value) for value in event_values}
+    numeric_values = pd.to_numeric(pd.Series(unique_values), errors="coerce")
+
+    if (
+        len(unique_values) == 2
+        and numeric_values.notna().all()
+        and len(event_keys) == 1
+    ):
+        return [
+            value
+            for value in unique_values
+            if _canonical_value(value) not in event_keys
+        ]
+
+    censor_markers = {
+        "0",
+        "false",
+        "no",
+        "n",
+        "alive",
+        "living",
+        "censored",
+        "censor",
+        "no event",
+        "event free",
+        "event-free",
+        "disease free",
+        "disease-free",
+        "no death",
+    }
+    return [
+        value
+        for value in unique_values
+        if (
+            _canonical_value(value) in censor_markers
+            and _canonical_value(value) not in event_keys
+        )
+    ]
+
+
 def _suggest_time_unit(time_col: str) -> str:
     normalized = str(time_col).lower()
 
@@ -1011,6 +1863,14 @@ def _format_value(value: Any) -> str:
     if pd.isna(value):
         return "missing"
     return str(value)
+
+
+def _format_event_handling(value: str) -> str:
+    return {
+        "exclude": "Exclude",
+        "treat_as_censored": "Treat as censored",
+        "treat_as_event": "Treat as events",
+    }.get(value, str(value))
 
 
 def _json_safe_config(config: SurvivalConfig) -> dict[str, Any]:

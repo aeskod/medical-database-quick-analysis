@@ -103,6 +103,60 @@ def test_compute_survival_quality_bad_values():
     assert any(issue.severity == "error" for issue in survival_quality["issues"])
 
 
+def test_survival_quality_counts_missing_as_censored_consistently():
+    df = pd.DataFrame(
+        {
+            "time": [10, 20, 30, 40],
+            "status": ["Dead", "Alive", None, "Unknown"],
+        }
+    )
+    config = SurvivalConfig(
+        time_col="time",
+        event_col="status",
+        event_values=["Dead"],
+        censor_values=["Alive"],
+        missing_event_handling="treat_as_censored",
+        unmapped_event_handling="treat_as_event",
+    )
+    survival_ready_df = create_survival_ready_dataframe(df, config)
+
+    quality = compute_survival_quality(df, config, survival_ready_df)
+
+    assert len(survival_ready_df) == 4
+    assert quality["usable_survival_rows"] == 4
+    assert quality["excluded_rows"] == 0
+    assert quality["events"] == 2
+    assert quality["censored"] == 2
+    assert quality["event_rate"] == 50.0
+    assert quality["survival_exclusion_breakdown"].empty
+
+
+def test_survival_quality_excludes_missing_and_unmapped_by_default():
+    df = pd.DataFrame(
+        {
+            "time": [10, 20, 30, 40],
+            "status": ["Dead", "Alive", None, "Unknown"],
+        }
+    )
+    config = SurvivalConfig(
+        time_col="time",
+        event_col="status",
+        event_values=["Dead"],
+        censor_values=["Alive"],
+    )
+
+    quality = compute_survival_quality(df, config)
+
+    assert quality["usable_survival_rows"] == 2
+    assert quality["excluded_rows"] == 2
+    assert quality["events"] == 1
+    assert quality["censored"] == 1
+    assert set(quality["survival_exclusion_breakdown"]["reason"]) == {
+        "missing event",
+        "unmapped event value",
+    }
+
+
 def test_compute_group_quality():
     survival_ready_df = pd.DataFrame(
         {

@@ -8,6 +8,11 @@ from src.profiling import normalize_missing_values
 
 
 ALLOWED_MISSING_EVENT_HANDLING = {"exclude", "treat_as_censored"}
+ALLOWED_UNMAPPED_EVENT_HANDLING = {
+    "exclude",
+    "treat_as_censored",
+    "treat_as_event",
+}
 
 
 @dataclass
@@ -20,6 +25,7 @@ class SurvivalConfig:
     group_col: Optional[str] = None
     time_unit: str = "unknown"
     missing_event_handling: str = "exclude"
+    unmapped_event_handling: str = "exclude"
 
 
 def validate_survival_config(
@@ -32,6 +38,12 @@ def validate_survival_config(
 
     if config.missing_event_handling not in ALLOWED_MISSING_EVENT_HANDLING:
         errors.append("Missing event handling must be 'exclude' or 'treat_as_censored'.")
+
+    if config.unmapped_event_handling not in ALLOWED_UNMAPPED_EVENT_HANDLING:
+        errors.append(
+            "Unmapped event handling must be 'exclude', "
+            "'treat_as_censored', or 'treat_as_event'."
+        )
 
     time_exists = config.time_col in normalized.columns
     event_exists = config.event_col in normalized.columns
@@ -79,7 +91,14 @@ def validate_survival_config(
             errors.append("Event column has no non-missing values.")
 
         if event_series.isna().any():
-            warnings.append("Event column has missing values; those rows will be excluded by default.")
+            missing_action = (
+                "will be treated as censored"
+                if config.missing_event_handling == "treat_as_censored"
+                else "will be excluded"
+            )
+            warnings.append(
+                f"Event column has missing values; those rows {missing_action}."
+            )
 
         mapped_value_keys = event_value_keys | censor_value_keys
         unmapped_values = [
@@ -88,9 +107,15 @@ def validate_survival_config(
             if _canonical_value(value) not in mapped_value_keys
         ]
         if unmapped_values:
+            unmapped_action = {
+                "exclude": "will be excluded",
+                "treat_as_censored": "will be treated as censored",
+                "treat_as_event": "will be treated as events",
+            }.get(config.unmapped_event_handling, "have invalid handling")
             warnings.append(
                 "Event column contains unmapped values: "
                 + ", ".join(_format_value(value) for value in unmapped_values[:10])
+                + f"; those rows {unmapped_action}."
             )
 
     if config.id_col is None:
@@ -154,7 +179,12 @@ def create_binary_event_series(df: pd.DataFrame, config: SurvivalConfig) -> pd.S
         elif value_key in censor_value_keys:
             mapped_values.append(0)
         else:
-            mapped_values.append(pd.NA)
+            mapped_values.append(
+                {
+                    "treat_as_censored": 0,
+                    "treat_as_event": 1,
+                }.get(config.unmapped_event_handling, pd.NA)
+            )
 
     return pd.Series(mapped_values, index=df.index, name="_event", dtype="Int64")
 
@@ -209,5 +239,6 @@ def _has_blocking_column_errors(errors: list[str]) -> bool:
         "At least one event value",
         "cannot overlap",
         "Missing event handling",
+        "Unmapped event handling",
     )
     return any(any(fragment in error for fragment in blocking_fragments) for error in errors)

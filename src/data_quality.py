@@ -4,6 +4,11 @@ from typing import Any, Optional
 import pandas as pd
 
 from src.profiling import normalize_missing_values
+from src.survival_mapping import (
+    ALLOWED_MISSING_EVENT_HANDLING,
+    ALLOWED_UNMAPPED_EVENT_HANDLING,
+    create_binary_event_series,
+)
 
 
 HIGH_RISK_NAME_HINTS = [
@@ -298,6 +303,16 @@ def compute_survival_quality(
     event_keys = {_canonical_value(value) for value in event_values}
     censor_keys = {_canonical_value(value) for value in censor_values}
     mapped_event_keys = event_keys | censor_keys
+    missing_event_handling = getattr(
+        survival_config,
+        "missing_event_handling",
+        "exclude",
+    )
+    unmapped_event_handling = getattr(
+        survival_config,
+        "unmapped_event_handling",
+        "exclude",
+    )
 
     time_col = getattr(survival_config, "time_col", None)
     event_col = getattr(survival_config, "event_col", None)
@@ -320,6 +335,8 @@ def compute_survival_quality(
         "zero_time_count": None,
         "unmapped_event_value_count": None,
         "unmapped_event_values": [],
+        "missing_event_handling": missing_event_handling,
+        "unmapped_event_handling": unmapped_event_handling,
     }
 
     if time_col not in normalized_df.columns:
@@ -358,6 +375,26 @@ def compute_survival_quality(
                 severity="error",
                 category="survival_event",
                 message="Event and censor value mappings overlap.",
+                affected_columns=[str(event_col)],
+            )
+        )
+
+    if missing_event_handling not in ALLOWED_MISSING_EVENT_HANDLING:
+        issues.append(
+            QualityIssue(
+                severity="error",
+                category="survival_event",
+                message="Missing event handling is invalid.",
+                affected_columns=[str(event_col)],
+            )
+        )
+
+    if unmapped_event_handling not in ALLOWED_UNMAPPED_EVENT_HANDLING:
+        issues.append(
+            QualityIssue(
+                severity="error",
+                category="survival_event",
+                message="Unmapped event handling is invalid.",
                 affected_columns=[str(event_col)],
             )
         )
@@ -430,47 +467,77 @@ def compute_survival_quality(
         event_missing_mask = event_series.isna()
         event_key_series = event_series.map(_canonical_value)
         unmapped_event_mask = event_series.notna() & ~event_key_series.isin(mapped_event_keys)
-        event_mask = event_key_series.isin(event_keys)
-        censor_mask = event_key_series.isin(censor_keys)
         unmapped_event_values = [
             str(value)
             for value in pd.unique(event_series[unmapped_event_mask])
         ]
+        binary_event_series = create_binary_event_series(
+            normalized_df,
+            survival_config,
+        )
 
         result["event_missing_count"] = int(event_missing_mask.sum())
         result["unmapped_event_value_count"] = int(unmapped_event_mask.sum())
         result["unmapped_event_values"] = unmapped_event_values
-        result["events"] = int(event_mask.sum())
-        result["censored"] = int(censor_mask.sum())
+
+        if result["event_missing_count"] > 0:
+            missing_action = (
+                "treated as censored"
+                if missing_event_handling == "treat_as_censored"
+                else "excluded"
+            )
+            issues.append(
+                QualityIssue(
+                    severity="warning",
+                    category="survival_event",
+                    message=f"Event column has missing values; those rows are {missing_action}.",
+                    affected_columns=[event_col],
+                    affected_rows_count=result["event_missing_count"],
+                    details={"missing_event_handling": missing_event_handling},
+                )
+            )
+
+        if result["unmapped_event_value_count"] > 0:
+            unmapped_action = {
+                "exclude": "excluded",
+                "treat_as_censored": "treated as censored",
+                "treat_as_event": "treated as events",
+            }.get(unmapped_event_handling, "handled by an invalid policy")
+            issues.append(
+                QualityIssue(
+                    severity="warning",
+                    category="survival_event",
+                    message=(
+                        "Event column contains unmapped non-missing values; "
+                        f"those rows are {unmapped_action}."
+                    ),
+                    affected_columns=[event_col],
+                    affected_rows_count=result["unmapped_event_value_count"],
+                    details={
+                        "unmapped_event_values": unmapped_event_values,
+                        "unmapped_event_handling": unmapped_event_handling,
+                    },
+                )
+            )
+        if missing_event_handling != "treat_as_censored":
+            exclusion_masks["missing event"] = event_missing_mask
+        if unmapped_event_handling == "exclude":
+            exclusion_masks["unmapped event value"] = unmapped_event_mask
+
+    exclusion_union_mask = _union_exclusion_masks(exclusion_masks, normalized_df.index)
+    result["excluded_rows"] = int(exclusion_union_mask.sum())
+    result["usable_survival_rows"] = max(raw_rows - result["excluded_rows"], 0)
+
+    if event_col in normalized_df.columns:
+        usable_binary_events = binary_event_series.loc[~exclusion_union_mask].dropna()
+        result["events"] = int((usable_binary_events == 1).sum())
+        result["censored"] = int((usable_binary_events == 0).sum())
         result["event_rate"] = round(
             (result["events"] / (result["events"] + result["censored"]) * 100)
             if (result["events"] + result["censored"])
             else 0.0,
             2,
         )
-
-        if result["event_missing_count"] > 0:
-            issues.append(
-                QualityIssue(
-                    severity="warning",
-                    category="survival_event",
-                    message="Event column has missing values.",
-                    affected_columns=[event_col],
-                    affected_rows_count=result["event_missing_count"],
-                )
-            )
-
-        if result["unmapped_event_value_count"] > 0:
-            issues.append(
-                QualityIssue(
-                    severity="warning",
-                    category="survival_event",
-                    message="Event column contains unmapped non-missing values.",
-                    affected_columns=[event_col],
-                    affected_rows_count=result["unmapped_event_value_count"],
-                    details={"unmapped_event_values": unmapped_event_values},
-                )
-            )
 
         if result["events"] == 0:
             issues.append(
@@ -491,25 +558,6 @@ def compute_survival_quality(
                     affected_columns=[event_col],
                 )
             )
-
-        exclusion_masks["missing event"] = event_missing_mask
-        exclusion_masks["unmapped event value"] = unmapped_event_mask
-
-    exclusion_union_mask = _union_exclusion_masks(exclusion_masks, normalized_df.index)
-    result["excluded_rows"] = int(exclusion_union_mask.sum())
-    result["usable_survival_rows"] = max(raw_rows - result["excluded_rows"], 0)
-
-    if event_col in normalized_df.columns:
-        usable_event_series = normalized_df.loc[~exclusion_union_mask, event_col]
-        usable_event_keys = usable_event_series.map(_canonical_value)
-        result["events"] = int(usable_event_keys.isin(event_keys).sum())
-        result["censored"] = int(usable_event_keys.isin(censor_keys).sum())
-        result["event_rate"] = round(
-            (result["events"] / (result["events"] + result["censored"]) * 100)
-            if (result["events"] + result["censored"])
-            else 0.0,
-            2,
-        )
 
     result["survival_exclusion_breakdown"] = _build_survival_exclusion_breakdown(
         exclusion_masks,
