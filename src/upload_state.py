@@ -1,9 +1,30 @@
 import hashlib
 import json
 import pickle
+from pathlib import PurePath
 from typing import Any
 
 import pandas as pd
+
+
+def dataset_content_signature(
+    file_name: str,
+    df: pd.DataFrame,
+    *,
+    content_digest: str | None = None,
+) -> str:
+    """Return a stable identity for the dataset as parsed by the application.
+
+    Uploaded bytes are the primary identity. The normalized extension is also
+    included because it selects the parser and identical bytes can produce
+    different tables when, for example, they are uploaded as CSV versus TSV.
+    Dataframe-only callers use a content digest of the parsed table.
+    """
+    if content_digest is not None:
+        parser_extension = PurePath(str(file_name)).suffix.casefold() or "<none>"
+        return f"sha256:{content_digest};parser-extension:{parser_extension}"
+
+    return f"dataframe-sha256:{dataframe_content_digest(df)}"
 
 
 def uploaded_file_content_digest(uploaded_file: Any) -> str:

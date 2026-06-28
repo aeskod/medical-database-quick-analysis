@@ -3,7 +3,11 @@ from io import BytesIO
 import pandas as pd
 
 import app
-from src.upload_state import dataframe_content_digest, uploaded_file_content_digest
+from src.upload_state import (
+    dataframe_content_digest,
+    dataset_content_signature,
+    uploaded_file_content_digest,
+)
 
 
 class NamedBytesIO(BytesIO):
@@ -31,6 +35,28 @@ def test_dataframe_digest_changes_when_only_cell_values_change():
     assert first.shape == second.shape
     assert list(first.columns) == list(second.columns)
     assert dataframe_content_digest(first) != dataframe_content_digest(second)
+
+
+def test_dataset_signature_accounts_for_parser_and_ignores_basename():
+    df = pd.DataFrame({"time": [10, 20], "status": [1, 0]})
+    digest = "a" * 64
+
+    csv_signature = dataset_content_signature(
+        "clinical.csv",
+        df,
+        content_digest=digest,
+    )
+
+    assert csv_signature == dataset_content_signature(
+        "renamed.CSV",
+        df,
+        content_digest=digest,
+    )
+    assert csv_signature != dataset_content_signature(
+        "clinical.tsv",
+        df,
+        content_digest=digest,
+    )
 
 
 def test_dataset_replacement_clears_all_derived_state_but_keeps_unrelated_state(
@@ -61,6 +87,7 @@ def test_dataset_replacement_clears_all_derived_state_but_keeps_unrelated_state(
         "chart_y_col",
         "chart_color_col",
         "survival_analysis_group_col",
+        "survival_timepoints",
         "group_value_labels",
         "time_col_recommended",
         "event_col_all_columns",
@@ -85,7 +112,9 @@ def test_dataset_replacement_clears_all_derived_state_but_keeps_unrelated_state(
     assert set(state["column_annotations"]) == {"time", "status"}
     assert state["unrelated_preference"] == "keep"
     pd.testing.assert_frame_equal(state["uploaded_df"], second)
-    assert state["uploaded_dataset_signature"] == f"sha256:{second_digest}"
+    assert state["uploaded_dataset_signature"] == (
+        f"sha256:{second_digest};parser-extension:.csv"
+    )
 
 
 def test_same_content_preserves_confirmed_mapping_and_returns_not_replaced(

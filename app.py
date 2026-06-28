@@ -70,7 +70,7 @@ from src.survival_mapping import (
     validate_survival_config,
 )
 from src.survival_plots import plot_km_curve
-from src.upload_state import dataframe_content_digest, uploaded_file_content_digest
+from src.upload_state import dataset_content_signature, uploaded_file_content_digest
 
 
 DATASET_DERIVED_SESSION_KEYS = {
@@ -88,6 +88,7 @@ DATASET_DERIVED_SESSION_KEYS = {
     "chart_color_col",
     "chart_color_col_not_applicable",
     "survival_analysis_group_col",
+    "survival_timepoints",
     "group_value_labels",
     "column_annotations",
     "annotation_editor_version",
@@ -266,9 +267,11 @@ def _sync_uploaded_dataset_state(
     content_digest: str | None = None,
 ) -> bool:
     """Synchronize upload state and report whether an existing dataset was replaced."""
-    del file_name  # A rename alone does not make identical content a new dataset.
-    resolved_digest = content_digest or dataframe_content_digest(df)
-    dataset_signature = f"sha256:{resolved_digest}"
+    dataset_signature = dataset_content_signature(
+        file_name,
+        df,
+        content_digest=content_digest,
+    )
     previous_signature = st.session_state.get("uploaded_dataset_signature")
     dataset_changed = previous_signature != dataset_signature
     dataset_replaced = previous_signature is not None and dataset_changed
@@ -1151,7 +1154,11 @@ def _render_survival_analysis_tab() -> None:
     st.subheader("Selected time points")
     suggested_timepoints = suggest_timepoints(summary["max_followup"], config.time_unit)
     default_timepoint_text = ", ".join(_format_number(timepoint) for timepoint in suggested_timepoints)
-    timepoint_text = st.text_input("Time points", default_timepoint_text)
+    timepoint_text = st.text_input(
+        "Time points",
+        default_timepoint_text,
+        key="survival_timepoints",
+    )
     timepoints, parse_warning = _parse_timepoints(timepoint_text, suggested_timepoints)
 
     if parse_warning:

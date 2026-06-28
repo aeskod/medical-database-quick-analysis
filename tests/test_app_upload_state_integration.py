@@ -38,6 +38,7 @@ def test_reupload_changed_content_with_same_name_resets_full_app_state():
     )
     app_test.session_state["chart_x_col"] = "status"
     app_test.session_state["event_values_status"] = [0]
+    app_test.session_state["survival_timepoints"] = "100, 200"
 
     app_test.file_uploader[0].clear().upload(
         "clinical.csv",
@@ -48,11 +49,12 @@ def test_reupload_changed_content_with_same_name_resets_full_app_state():
     assert not app_test.exception
     assert "survival_config" not in app_test.session_state
     assert "survival_ready_df" not in app_test.session_state
+    assert "survival_timepoints" not in app_test.session_state
     assert app_test.session_state["chart_x_col"] == "time"
     assert "event_values_status" in app_test.session_state
     assert app_test.session_state["event_values_status"] == [1]
     assert app_test.session_state["uploaded_dataset_signature"] == (
-        f"sha256:{hashlib.sha256(CHANGED_CSV).hexdigest()}"
+        f"sha256:{hashlib.sha256(CHANGED_CSV).hexdigest()};parser-extension:.csv"
     )
     pd.testing.assert_frame_equal(
         app_test.session_state["uploaded_df"],
@@ -99,6 +101,39 @@ def test_same_content_under_new_filename_preserves_confirmed_analysis_state():
         ready_df,
     )
     assert not any(
+        "A different dataset was detected" in message.value
+        for message in app_test.info
+    )
+
+
+def test_same_bytes_with_different_parser_extension_resets_analysis_state():
+    app_test = AppTest.from_file("app.py").run(timeout=30)
+    app_test.file_uploader[0].upload(
+        "clinical.csv",
+        FIRST_CSV,
+        "text/csv",
+    ).run(timeout=30)
+    assert not app_test.exception
+
+    df = app_test.session_state["uploaded_df"]
+    config = _config()
+    app_test.session_state["survival_config"] = config
+    app_test.session_state["survival_ready_df"] = create_survival_ready_dataframe(
+        df,
+        config,
+    )
+
+    app_test.file_uploader[0].clear().upload(
+        "clinical.tsv",
+        FIRST_CSV,
+        "text/tab-separated-values",
+    ).run(timeout=30)
+
+    assert not app_test.exception
+    assert "survival_config" not in app_test.session_state
+    assert "survival_ready_df" not in app_test.session_state
+    assert app_test.session_state["uploaded_df"].columns.tolist() == ["time,status"]
+    assert any(
         "A different dataset was detected" in message.value
         for message in app_test.info
     )
