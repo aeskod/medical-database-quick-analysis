@@ -540,6 +540,41 @@ def plot_missingness_bar(
     return fig
 
 
+def plot_missingness_heatmap(
+    df: pd.DataFrame,
+    max_rows: int = 250,
+    title: str = "Missingness heatmap",
+) -> go.Figure:
+    missing = normalize_missing_values(df).head(max_rows).isna().astype(int)
+    display = missing.T.replace({0: "Present", 1: "Missing"})
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=missing.T.values,
+            x=missing.index.astype(str).tolist(),
+            y=missing.columns.astype(str).tolist(),
+            zmin=0,
+            zmax=1,
+            colorscale=[
+                [0, "#f7fbff"],
+                [0.499, "#f7fbff"],
+                [0.5, "#d7301f"],
+                [1, "#d7301f"],
+            ],
+            colorbar={"title": "Value", "tickvals": [0, 1], "ticktext": ["Present", "Missing"]},
+            customdata=display.values,
+            hovertemplate="Row %{x}<br>Column %{y}<br>%{customdata}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Dataset row",
+        yaxis_title="Column",
+        height=max(320, min(900, 120 + 24 * len(missing.columns))),
+    )
+    _style_figure(fig)
+    return fig
+
+
 def build_chart(
     df: pd.DataFrame,
     chart_type: str,

@@ -135,6 +135,9 @@ def apply_survival_roles(
     protected_meanings = {
         getattr(survival_config, "time_col", None): "Follow-up time / survival time",
         getattr(survival_config, "event_col", None): "Event status",
+        getattr(survival_config, "start_date_col", None): "Start time",
+        getattr(survival_config, "event_date_col", None): "Date",
+        getattr(survival_config, "last_followup_date_col", None): "End time",
         getattr(survival_config, "id_col", None): "Patient ID",
     }
     for column, meaning in protected_meanings.items():

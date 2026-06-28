@@ -1,10 +1,13 @@
 import pandas as pd
 
+from src.column_annotations import ColumnAnnotation
 from src.data_quality import (
     QualityIssue,
     build_data_quality_report,
     check_duplicate_patient_ids,
     check_duplicate_rows,
+    compute_age_quality,
+    compute_date_quality,
     compute_dataset_overview,
     compute_group_quality,
     compute_missingness_by_column,
@@ -63,6 +66,64 @@ def test_check_duplicate_patient_ids_when_no_id_selected():
 
     assert duplicate_ids["checked"] is False
     assert duplicate_ids["duplicate_id_row_count"] is None
+
+
+def test_compute_age_quality_counts_out_of_range_and_non_numeric_values():
+    df = pd.DataFrame(
+        {
+            "age_at_diagnosis": [42, -1, 121, "unknown", None],
+            "unrelated_number": [-5, 500, 2, 3, 4],
+        }
+    )
+    annotations = {
+        "age_at_diagnosis": ColumnAnnotation("age_at_diagnosis", "Age"),
+    }
+
+    quality, issues = compute_age_quality(df, annotations)
+
+    assert quality["age_columns"] == ["age_at_diagnosis"]
+    assert quality["invalid_age_count"] == 3
+    assert quality["details"].to_dict("records") == [
+        {
+            "column_name": "age_at_diagnosis",
+            "invalid_count": 3,
+            "below_zero_count": 1,
+            "above_120_count": 1,
+            "non_numeric_count": 1,
+        }
+    ]
+    assert issues[0].category == "age"
+    assert issues[0].affected_rows_count == 3
+
+
+def test_compute_date_quality_finds_parse_and_chronology_errors():
+    df = pd.DataFrame(
+        {
+            "diagnosis_date": ["2024-01-10", "2024-01-10", "not-a-date", None],
+            "event_date": ["2024-01-09", "2024-01-20", "2024-02-01", None],
+            "last_followup_date": ["2024-01-08", "2024-01-30", "2024-02-10", None],
+        }
+    )
+    config = SurvivalConfig(
+        time_col=None,
+        event_col=None,
+        event_values=[],
+        censor_values=[],
+        time_source="dates",
+        start_date_col="diagnosis_date",
+        event_date_col="event_date",
+        last_followup_date_col="last_followup_date",
+    )
+
+    quality, issues = compute_date_quality(df, survival_config=config)
+
+    invalid_dates = quality["parsing"].set_index("column_name")["invalid_count"]
+    consistency = quality["consistency"].set_index("check")["affected_rows_count"]
+    assert invalid_dates["diagnosis_date"] == 1
+    assert quality["invalid_date_count"] == 1
+    assert consistency["Event date before diagnosis/start date"] == 1
+    assert consistency["Last follow-up before start date"] == 1
+    assert {issue.category for issue in issues} == {"date_parsing", "date_consistency"}
 
 
 def test_compute_survival_quality_good_mapping():
@@ -155,6 +216,37 @@ def test_survival_quality_excludes_missing_and_unmapped_by_default():
         "missing event",
         "unmapped event value",
     }
+
+
+def test_survival_quality_uses_date_derived_results():
+    df = pd.DataFrame(
+        {
+            "start": ["2024-01-01", "2024-01-01"],
+            "event_date": ["2024-01-11", None],
+            "last_followup": ["2024-02-01", "2024-01-21"],
+        }
+    )
+    config = SurvivalConfig(
+        time_col=None,
+        event_col=None,
+        event_values=[],
+        censor_values=[],
+        time_source="dates",
+        start_date_col="start",
+        event_date_col="event_date",
+        last_followup_date_col="last_followup",
+        missing_event_handling="treat_as_censored",
+        time_unit="days",
+    )
+    ready = create_survival_ready_dataframe(df, config)
+
+    quality = compute_survival_quality(df, config, ready)
+
+    assert quality["time_col"] == "Derived from dates"
+    assert quality["usable_survival_rows"] == 2
+    assert quality["excluded_rows"] == 0
+    assert quality["events"] == 1
+    assert quality["censored"] == 1
 
 
 def test_compute_group_quality():

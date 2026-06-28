@@ -11,6 +11,7 @@ from src.charts import (
     plot_correlation_heatmap,
     plot_histogram,
     plot_missingness_bar,
+    plot_missingness_heatmap,
     plot_scatter,
     prepare_categorical_series,
     recommend_chart_type,
@@ -191,6 +192,22 @@ def test_missingness_bar_returns_figure():
     df = pd.DataFrame({"age": [50, None, 70], "sex": ["M", "F", None]})
 
     assert isinstance(plot_missingness_bar(df), go.Figure)
+
+
+def test_missingness_heatmap_marks_normalized_missing_values_and_caps_rows():
+    df = pd.DataFrame(
+        {
+            "a": [1, None, 3],
+            "b": ["NA", "x", None],
+        }
+    )
+
+    figure = plot_missingness_heatmap(df, max_rows=2)
+
+    assert isinstance(figure, go.Figure)
+    assert figure.data[0].z.tolist() == [[0, 1], [1, 0]]
+    assert list(figure.data[0].y) == ["a", "b"]
+    assert list(figure.data[0].x) == ["0", "1"]
 
 
 def test_correlation_heatmap_requires_two_numeric_columns():

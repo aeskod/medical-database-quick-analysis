@@ -1,5 +1,5 @@
 import re
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 
@@ -33,12 +33,22 @@ CONTINUOUS_NAME_HINTS = [
     "count",
 ]
 TEXT_LENGTH_THRESHOLD = 80
+COHORT_MEANINGS = {
+    "Patient ID": "patient_id",
+    "Age": "age",
+    "Sex / gender": "sex",
+    "Diagnosis": "diagnosis",
+    "Treatment / exposure group": "treatment",
+    "Outcome other than survival": "outcome",
+}
 
 
 def compute_cohort_overview_metrics(
     df: pd.DataFrame,
     survival_ready_df: pd.DataFrame | None = None,
     time_unit: str = "unknown",
+    id_col: str | None = None,
+    age_col: str | None = None,
 ) -> dict[str, Any]:
     source_df = normalize_missing_values(df)
     n_rows = len(source_df)
@@ -46,8 +56,23 @@ def compute_cohort_overview_metrics(
     complete_rows = int(source_df.notna().all(axis=1).sum()) if n_columns else n_rows
     total_cells = n_rows * n_columns
     missing_cells = int(source_df.isna().sum().sum()) if total_cells else 0
+    has_patient_id = id_col is not None and id_col in source_df.columns
+    n_patients = (
+        int(source_df[id_col].nunique(dropna=True))
+        if has_patient_id
+        else n_rows
+    )
+    missing_patient_ids = int(source_df[id_col].isna().sum()) if has_patient_id else None
+    age = (
+        pd.to_numeric(source_df[age_col], errors="coerce").dropna()
+        if age_col is not None and age_col in source_df.columns
+        else pd.Series(dtype=float)
+    )
 
     metrics: dict[str, Any] = {
+        "n_patients": n_patients,
+        "patient_count_basis": f"Distinct {id_col}" if has_patient_id else "Dataset rows",
+        "missing_patient_ids": missing_patient_ids,
         "n_rows": n_rows,
         "n_columns": n_columns,
         "complete_rows": complete_rows,
@@ -59,6 +84,8 @@ def compute_cohort_overview_metrics(
         "event_rate": None,
         "median_followup": None,
         "max_followup": None,
+        "median_age": round(float(age.median()), 2) if not age.empty else None,
+        "age_col": age_col if age_col in source_df.columns else None,
         "time_unit": time_unit,
     }
 
@@ -84,6 +111,28 @@ def compute_cohort_overview_metrics(
         }
     )
     return metrics
+
+
+def get_cohort_role_columns(
+    df: pd.DataFrame,
+    annotations: Mapping[str, Any] | None,
+) -> dict[str, list[str]]:
+    roles = {role: [] for role in COHORT_MEANINGS.values()}
+    if not isinstance(annotations, Mapping):
+        return roles
+
+    valid_columns = {str(column) for column in df.columns}
+    for column, annotation in annotations.items():
+        column_name = str(column)
+        if column_name not in valid_columns:
+            continue
+        meaning = getattr(annotation, "resolved_meaning", None)
+        if meaning is None and isinstance(annotation, Mapping):
+            meaning = annotation.get("meaning")
+        role = COHORT_MEANINGS.get(str(meaning))
+        if role is not None:
+            roles[role].append(column_name)
+    return roles
 
 
 def classify_summary_variable(
@@ -315,13 +364,22 @@ def build_baseline_table(
     max_levels: int = 10,
     include_missing: bool = True,
     group_value_labels: dict[str, str] | None = None,
+    survival_ready_df: pd.DataFrame | None = None,
+    id_col: str | None = None,
 ) -> pd.DataFrame:
     normalized = normalize_missing_values(df)
     continuous_vars = [variable for variable in continuous_vars if variable != group_col]
     categorical_vars = [variable for variable in categorical_vars if variable != group_col]
     group_values = _group_values(normalized, group_col)
     group_value_labels = group_value_labels or {}
-    rows = []
+    rows = _baseline_summary_rows(
+        normalized,
+        group_col,
+        group_values,
+        group_value_labels,
+        survival_ready_df,
+        id_col,
+    )
 
     for variable in continuous_vars:
         if variable not in normalized.columns:
@@ -386,6 +444,76 @@ def build_baseline_table(
         for group_value in group_values
     ]
     return pd.DataFrame(rows, columns=columns)
+
+
+def _baseline_summary_rows(
+    df: pd.DataFrame,
+    group_col: str | None,
+    group_values: list[str],
+    group_value_labels: dict[str, str],
+    survival_ready_df: pd.DataFrame | None,
+    id_col: str | None,
+) -> list[dict[str, str]]:
+    count_row = {"Variable": "n", "Overall": str(_patient_count(df, id_col))}
+    for group_value in group_values:
+        group_df = df[df[group_col].astype(str) == group_value]
+        count_row[_display_group_value(group_value, group_value_labels)] = str(
+            _patient_count(group_df, id_col)
+        )
+
+    event_row = {"Variable": "Events, n (%)", "Overall": "Not available"}
+    followup_row = {"Variable": "Follow-up, median [IQR]", "Overall": "Not available"}
+    if survival_ready_df is not None:
+        survival_df = survival_ready_df.copy(deep=True)
+        survival_df["_time"] = pd.to_numeric(survival_df["_time"], errors="coerce")
+        survival_df["_event"] = pd.to_numeric(survival_df["_event"], errors="coerce")
+        survival_df = survival_df.dropna(subset=["_time", "_event"])
+        event_row["Overall"] = _event_summary(survival_df)
+        followup_row["Overall"] = _followup_summary(survival_df)
+
+        for group_value in group_values:
+            column = _display_group_value(group_value, group_value_labels)
+            if "_group" not in survival_df.columns:
+                event_row[column] = "Not available"
+                followup_row[column] = "Not available"
+                continue
+            group_survival_df = survival_df[
+                survival_df["_group"].astype(str) == group_value
+            ]
+            event_row[column] = _event_summary(group_survival_df)
+            followup_row[column] = _followup_summary(group_survival_df)
+    else:
+        for group_value in group_values:
+            column = _display_group_value(group_value, group_value_labels)
+            event_row[column] = "Not available"
+            followup_row[column] = "Not available"
+
+    return [count_row, event_row, followup_row]
+
+
+def _patient_count(df: pd.DataFrame, id_col: str | None) -> int:
+    if id_col is not None and id_col in df.columns:
+        return int(df[id_col].nunique(dropna=True))
+    return len(df)
+
+
+def _event_summary(survival_df: pd.DataFrame) -> str:
+    total = len(survival_df)
+    if not total:
+        return "Not available"
+    events = int((survival_df["_event"] == 1).sum())
+    return _format_count_percent(events, events / total * 100)
+
+
+def _followup_summary(survival_df: pd.DataFrame) -> str:
+    followup = survival_df["_time"].dropna()
+    if followup.empty:
+        return "Not available"
+    return (
+        f"{_format_number(followup.median())} "
+        f"[{_format_number(followup.quantile(0.25))}, "
+        f"{_format_number(followup.quantile(0.75))}]"
+    )
 
 
 def count_variable_types(

@@ -1,5 +1,6 @@
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass, field, replace
+import re
+from typing import Any, Mapping, Optional
 
 import pandas as pd
 
@@ -8,6 +9,7 @@ from src.survival_mapping import (
     ALLOWED_MISSING_EVENT_HANDLING,
     ALLOWED_UNMAPPED_EVENT_HANDLING,
     create_binary_event_series,
+    derive_survival_from_dates,
 )
 
 
@@ -65,6 +67,7 @@ def build_data_quality_report(
     profile_df: pd.DataFrame | None = None,
     survival_config=None,
     survival_ready_df: pd.DataFrame | None = None,
+    annotations: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_df = normalize_missing_values(df)
     issues: list[QualityIssue] = []
@@ -114,6 +117,17 @@ def build_data_quality_report(
             )
         )
 
+    age_quality, age_issues = compute_age_quality(normalized_df, annotations)
+    issues.extend(age_issues)
+
+    date_quality, date_issues = compute_date_quality(
+        normalized_df,
+        profile_df,
+        survival_config,
+        annotations,
+    )
+    issues.extend(date_issues)
+
     survival_quality = compute_survival_quality(
         normalized_df,
         survival_config,
@@ -146,6 +160,8 @@ def build_data_quality_report(
         "missingness_by_row": missingness_by_row,
         "duplicate_rows": duplicate_rows,
         "duplicate_ids": duplicate_ids,
+        "age_quality": age_quality,
+        "date_quality": date_quality,
         "survival_quality": survival_quality,
         "survival_exclusion_breakdown": survival_quality.get(
             "survival_exclusion_breakdown",
@@ -284,6 +300,167 @@ def check_duplicate_patient_ids(
     }
 
 
+def compute_age_quality(
+    df: pd.DataFrame,
+    annotations: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[QualityIssue]]:
+    age_columns = [
+        str(column)
+        for column in df.columns
+        if _annotation_meaning(annotations, str(column)) == "Age"
+        or "age" in _column_tokens(str(column))
+    ]
+    invalid_rows = pd.Series(False, index=df.index)
+    details = []
+
+    for column in age_columns:
+        values = df[column]
+        numeric = pd.to_numeric(values, errors="coerce")
+        non_numeric = values.notna() & numeric.isna()
+        below_zero = numeric < 0
+        above_120 = numeric > 120
+        invalid = non_numeric | below_zero | above_120
+        invalid_rows |= invalid.fillna(False)
+        details.append(
+            {
+                "column_name": column,
+                "invalid_count": int(invalid.sum()),
+                "below_zero_count": int(below_zero.sum()),
+                "above_120_count": int(above_120.sum()),
+                "non_numeric_count": int(non_numeric.sum()),
+            }
+        )
+
+    invalid_count = int(invalid_rows.sum())
+    issues = []
+    if invalid_count:
+        issues.append(
+            QualityIssue(
+                severity="warning",
+                category="age",
+                message="Age values must be numeric and between 0 and 120.",
+                affected_columns=age_columns,
+                affected_rows_count=invalid_count,
+            )
+        )
+
+    return {
+        "checked": bool(age_columns),
+        "age_columns": age_columns,
+        "invalid_age_count": invalid_count if age_columns else None,
+        "details": pd.DataFrame(
+            details,
+            columns=[
+                "column_name",
+                "invalid_count",
+                "below_zero_count",
+                "above_120_count",
+                "non_numeric_count",
+            ],
+        ),
+    }, issues
+
+
+def compute_date_quality(
+    df: pd.DataFrame,
+    profile_df: pd.DataFrame | None = None,
+    survival_config=None,
+    annotations: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[QualityIssue]]:
+    date_columns = _date_columns(df, profile_df, survival_config, annotations)
+    parsed_dates = {
+        column: pd.to_datetime(df[column], errors="coerce", format="mixed", utc=True)
+        for column in date_columns
+    }
+    parsing_rows = []
+    issues: list[QualityIssue] = []
+
+    for column in date_columns:
+        invalid = df[column].notna() & parsed_dates[column].isna()
+        invalid_count = int(invalid.sum())
+        parsing_rows.append(
+            {
+                "column_name": column,
+                "non_missing_count": int(df[column].notna().sum()),
+                "invalid_count": invalid_count,
+                "invalid_percent": round(
+                    (invalid_count / int(df[column].notna().sum()) * 100)
+                    if df[column].notna().any()
+                    else 0.0,
+                    2,
+                ),
+            }
+        )
+        if invalid_count:
+            issues.append(
+                QualityIssue(
+                    severity="warning",
+                    category="date_parsing",
+                    message=f"Date column '{column}' contains unparseable values.",
+                    affected_columns=[column],
+                    affected_rows_count=invalid_count,
+                )
+            )
+
+    start_col, event_col, followup_col = _date_role_columns(
+        date_columns,
+        survival_config,
+        annotations,
+    )
+    consistency_rows = []
+    for label, earlier_col, later_col in [
+        ("Event date before diagnosis/start date", start_col, event_col),
+        ("Last follow-up before start date", start_col, followup_col),
+    ]:
+        if not earlier_col or not later_col:
+            continue
+        inconsistent = parsed_dates[later_col] < parsed_dates[earlier_col]
+        affected_count = int(inconsistent.sum())
+        consistency_rows.append(
+            {
+                "check": label,
+                "earlier_column": earlier_col,
+                "later_column": later_col,
+                "affected_rows_count": affected_count,
+            }
+        )
+        if affected_count:
+            issues.append(
+                QualityIssue(
+                    severity="error",
+                    category="date_consistency",
+                    message=f"{label} found.",
+                    affected_columns=[earlier_col, later_col],
+                    affected_rows_count=affected_count,
+                )
+            )
+
+    parsing = pd.DataFrame(
+        parsing_rows,
+        columns=[
+            "column_name",
+            "non_missing_count",
+            "invalid_count",
+            "invalid_percent",
+        ],
+    )
+    return {
+        "checked": bool(date_columns),
+        "date_columns": date_columns,
+        "invalid_date_count": int(parsing["invalid_count"].sum()) if not parsing.empty else None,
+        "parsing": parsing,
+        "consistency": pd.DataFrame(
+            consistency_rows,
+            columns=[
+                "check",
+                "earlier_column",
+                "later_column",
+                "affected_rows_count",
+            ],
+        ),
+    }, issues
+
+
 def compute_survival_quality(
     df: pd.DataFrame,
     survival_config,
@@ -297,6 +474,48 @@ def compute_survival_quality(
         }
 
     normalized_df = normalize_missing_values(df)
+    if getattr(survival_config, "time_source", "duration") == "dates":
+        derived = derive_survival_from_dates(normalized_df, survival_config)
+        quality_df = normalized_df.assign(
+            _derived_time=derived["_time"],
+            _derived_event=derived["_event"],
+        )
+        quality = compute_survival_quality(
+            quality_df,
+            replace(
+                survival_config,
+                time_source="duration",
+                time_col="_derived_time",
+                event_col="_derived_event",
+                event_values=[1],
+                censor_values=[0],
+                missing_event_handling="exclude",
+                unmapped_event_handling="exclude",
+            ),
+            survival_ready_df,
+        )
+        quality["time_col"] = "Derived from dates"
+        quality["event_col"] = survival_config.event_date_col
+        quality["event_missing_count"] = int(
+            normalized_df[survival_config.event_date_col].isna().sum()
+        )
+        quality["missing_event_handling"] = survival_config.missing_event_handling
+        for issue in quality["issues"]:
+            if "_derived_time" in issue.affected_columns:
+                issue.affected_columns = [
+                    survival_config.start_date_col,
+                    survival_config.event_date_col,
+                    survival_config.last_followup_date_col,
+                ]
+                issue.message = issue.message.replace(
+                    "Survival time column",
+                    "Date-derived survival time",
+                )
+            if "_derived_event" in issue.affected_columns:
+                issue.affected_columns = [survival_config.event_date_col]
+                issue.message = issue.message.replace("Event column", "Event date")
+        return quality
+
     issues: list[QualityIssue] = []
     event_values = list(getattr(survival_config, "event_values", []))
     censor_values = list(getattr(survival_config, "censor_values", []))
@@ -780,6 +999,108 @@ def _empty_survival_exclusion_breakdown() -> pd.DataFrame:
 
 def _empty_group_quality() -> pd.DataFrame:
     return pd.DataFrame(columns=["group", "n", "events", "censored", "event_rate", "median_time"])
+
+
+def _date_columns(
+    df: pd.DataFrame,
+    profile_df: pd.DataFrame | None,
+    survival_config,
+    annotations: Mapping[str, Any] | None,
+) -> list[str]:
+    candidates = set()
+    if profile_df is not None and {"column_name", "detected_type"}.issubset(profile_df.columns):
+        candidates.update(
+            profile_df.loc[profile_df["detected_type"] == "date", "column_name"].astype(str)
+        )
+
+    for column in df.columns:
+        column_name = str(column)
+        if (
+            _annotation_meaning(annotations, column_name) in {"Date", "Start time", "End time"}
+            or _column_tokens(column_name) & {"date", "dob"}
+        ):
+            candidates.add(column_name)
+
+    if survival_config is not None:
+        candidates.update(
+            column
+            for column in [
+                getattr(survival_config, "start_date_col", None),
+                getattr(survival_config, "event_date_col", None),
+                getattr(survival_config, "last_followup_date_col", None),
+            ]
+            if column
+        )
+
+    return [str(column) for column in df.columns if str(column) in candidates]
+
+
+def _date_role_columns(
+    date_columns: list[str],
+    survival_config,
+    annotations: Mapping[str, Any] | None,
+) -> tuple[str | None, str | None, str | None]:
+    configured = (
+        getattr(survival_config, "start_date_col", None),
+        getattr(survival_config, "event_date_col", None),
+        getattr(survival_config, "last_followup_date_col", None),
+    )
+    if all(column in date_columns for column in configured if column) and any(configured):
+        return configured
+
+    start_col = _first_role_column(
+        date_columns,
+        annotations,
+        "Start time",
+        {"start", "diagnosis", "diagnostic", "enrollment", "index"},
+    )
+    event_col = _first_role_column(
+        date_columns,
+        annotations,
+        None,
+        {"event", "death", "relapse", "progression"},
+    )
+    followup_col = _first_role_column(
+        date_columns,
+        annotations,
+        "End time",
+        {"followup", "follow", "contact", "seen", "end"},
+    )
+    return start_col, event_col, followup_col
+
+
+def _first_role_column(
+    columns: list[str],
+    annotations: Mapping[str, Any] | None,
+    meaning: str | None,
+    name_markers: set[str],
+) -> str | None:
+    if meaning:
+        for column in columns:
+            if _annotation_meaning(annotations, column) == meaning:
+                return column
+    return next(
+        (column for column in columns if _column_tokens(column) & name_markers),
+        None,
+    )
+
+
+def _annotation_meaning(
+    annotations: Mapping[str, Any] | None,
+    column: str,
+) -> str | None:
+    if not isinstance(annotations, Mapping) or column not in annotations:
+        return None
+    annotation = annotations[column]
+    if hasattr(annotation, "resolved_meaning"):
+        return str(annotation.resolved_meaning)
+    if isinstance(annotation, Mapping):
+        return str(annotation.get("meaning") or "")
+    return None
+
+
+def _column_tokens(column: str) -> set[str]:
+    return {token for token in re.split(r"[^a-z0-9]+", column.lower()) if token}
 
 
 def _canonical_value(value: Any) -> str:

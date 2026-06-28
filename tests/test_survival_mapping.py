@@ -4,6 +4,7 @@ from src.survival_mapping import (
     SurvivalConfig,
     create_binary_event_series,
     create_survival_ready_dataframe,
+    derive_survival_from_dates,
     validate_survival_config,
 )
 
@@ -177,3 +178,89 @@ def test_create_survival_ready_dataframe_drops_unusable_rows_and_keeps_optional_
     assert survival_ready_df["_time"].tolist() == [10, 20]
     assert survival_ready_df["_event"].tolist() == [1, 0]
     assert survival_ready_df["_id"].tolist() == ["A", "B"]
+
+
+def test_derive_survival_from_dates_uses_event_or_last_followup_date():
+    df = pd.DataFrame(
+        {
+            "start": ["2024-01-01", "2024-01-10", "2024-02-01"],
+            "event_date": ["2024-01-11", None, "2024-02-01 12:00"],
+            "last_followup": ["2024-01-20", "2024-02-09", "2024-03-01"],
+            "patient_id": ["A", "B", "C"],
+        }
+    )
+    config = SurvivalConfig(
+        time_col=None,
+        event_col=None,
+        event_values=[],
+        censor_values=[],
+        time_source="dates",
+        start_date_col="start",
+        event_date_col="event_date",
+        last_followup_date_col="last_followup",
+        missing_event_handling="treat_as_censored",
+        id_col="patient_id",
+        time_unit="days",
+    )
+
+    derived = derive_survival_from_dates(df, config)
+    ready = create_survival_ready_dataframe(df, config)
+
+    assert derived["_time"].tolist() == [10.0, 30.0, 0.5]
+    assert derived["_event"].tolist() == [1, 0, 1]
+    assert ready["_id"].tolist() == ["A", "B", "C"]
+
+
+def test_date_derivation_excludes_missing_event_dates_when_requested():
+    df = pd.DataFrame(
+        {
+            "start": ["2024-01-01", "2024-01-01"],
+            "event_date": ["2024-01-03", None],
+            "last_followup": ["2024-01-05", "2024-01-10"],
+        }
+    )
+    config = SurvivalConfig(
+        time_col=None,
+        event_col=None,
+        event_values=[],
+        censor_values=[],
+        time_source="dates",
+        start_date_col="start",
+        event_date_col="event_date",
+        last_followup_date_col="last_followup",
+        missing_event_handling="exclude",
+        time_unit="days",
+    )
+
+    ready = create_survival_ready_dataframe(df, config)
+
+    assert ready[["_time", "_event"]].to_dict("records") == [
+        {"_time": 2.0, "_event": 1},
+    ]
+
+
+def test_validate_date_derivation_rejects_unparseable_and_negative_dates():
+    df = pd.DataFrame(
+        {
+            "start": ["2024-01-10", "not-a-date"],
+            "event_date": ["2024-01-05", None],
+            "last_followup": ["2024-01-20", "2024-02-01"],
+        }
+    )
+    config = SurvivalConfig(
+        time_col=None,
+        event_col=None,
+        event_values=[],
+        censor_values=[],
+        time_source="dates",
+        start_date_col="start",
+        event_date_col="event_date",
+        last_followup_date_col="last_followup",
+        missing_event_handling="treat_as_censored",
+        time_unit="days",
+    )
+
+    errors, _ = validate_survival_config(df, config)
+
+    assert any("start" in error and "unparseable" in error for error in errors)
+    assert any("negative" in error for error in errors)

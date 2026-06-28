@@ -27,6 +27,7 @@ from src.charts import (
     build_chart,
     explain_chart_recommendation,
     get_chart_variable_type,
+    plot_missingness_heatmap,
 )
 from src.data_quality import (
     build_data_quality_report,
@@ -37,7 +38,10 @@ from src.cohort_overview import (
     build_baseline_table,
     compute_cohort_overview_metrics,
     count_variable_types,
+    get_cohort_role_columns,
     get_default_baseline_variables,
+    summarize_categorical_variable,
+    summarize_continuous_variable,
 )
 from src.data_loading import (
     DatasetMetadata,
@@ -94,11 +98,15 @@ DATASET_DERIVED_SESSION_KEYS = {
     "annotation_editor_version",
     "annotation_status_message",
     "show_more_preview_rows",
+    "survival_time_source",
 }
 
 DATASET_DERIVED_SESSION_PREFIXES = (
     "time_col_",
     "event_col_",
+    "start_date_col_",
+    "event_date_col_",
+    "last_followup_date_col_",
     "id_col_",
     "group_col_",
     "event_values_",
@@ -315,14 +323,16 @@ def _render_data_quality_tab() -> None:
         profile_df=profile_df,
         survival_config=st.session_state.get("survival_config"),
         survival_ready_df=st.session_state.get("survival_ready_df"),
+        annotations=st.session_state.get("column_annotations"),
     )
     st.session_state["data_quality_report"] = report
 
     _render_quality_status(report["issues"])
     _render_quality_summary_cards(report)
     _render_quality_issues(report["issues"])
-    _render_missingness_section(report)
+    _render_missingness_section(report, uploaded_df)
     _render_duplicate_checks(report)
+    _render_clinical_value_checks(report)
     _render_survival_quality_section(report)
     _render_group_quality_section(report)
     _render_sensitive_columns_section(report)
@@ -341,22 +351,36 @@ def _render_quality_status(issues: list[Any]) -> None:
 
 def _render_quality_summary_cards(report: dict[str, Any]) -> None:
     overview = report["overview"]
-    duplicate_rows = report["duplicate_rows"]
+    duplicate_ids = report["duplicate_ids"]
+    age_quality = report["age_quality"]
     survival_quality = report["survival_quality"]
 
-    first_row = st.columns(4)
-    first_row[0].metric("Rows", overview["n_rows"])
-    first_row[1].metric("Columns", overview["n_columns"])
-    first_row[2].metric("Missing cells", overview["missing_cells"])
-    first_row[3].metric("Duplicate rows", duplicate_rows["duplicate_row_count"])
+    first_row = st.columns(3)
+    first_row[0].metric("Missing cells", f"{overview['missing_percent']}%")
+    first_row[1].metric(
+        "Duplicate IDs",
+        duplicate_ids["duplicate_id_value_count"] if duplicate_ids["checked"] else "Not checked",
+    )
+    first_row[2].metric(
+        "Invalid ages",
+        age_quality["invalid_age_count"] if age_quality["checked"] else "Not detected",
+    )
 
-    second_row = st.columns(2)
+    second_row = st.columns(3)
     if survival_quality.get("has_mapping"):
-        second_row[0].metric("Usable survival rows", survival_quality["usable_survival_rows"])
-        second_row[1].metric("Excluded survival rows", survival_quality["excluded_rows"])
+        second_row[0].metric(
+            "Invalid event values",
+            survival_quality["unmapped_event_value_count"],
+        )
+        second_row[1].metric("Zero follow-up rows", survival_quality["zero_time_count"])
+        second_row[2].metric(
+            "Analysis-ready rows",
+            f"{survival_quality['usable_survival_rows']} / {survival_quality['raw_rows']}",
+        )
     else:
-        second_row[0].metric("Usable survival rows", "Not available")
-        second_row[1].metric("Excluded survival rows", "Not available")
+        second_row[0].metric("Invalid event values", "Not mapped")
+        second_row[1].metric("Zero follow-up rows", "Not mapped")
+        second_row[2].metric("Analysis-ready rows", "Not mapped")
 
 
 def _render_quality_issues(issues: list[Any]) -> None:
@@ -373,14 +397,15 @@ def _render_quality_issues(issues: list[Any]) -> None:
     st.dataframe(issue_df, hide_index=True, width="stretch")
 
 
-def _render_missingness_section(report: dict[str, Any]) -> None:
+def _render_missingness_section(report: dict[str, Any], df: pd.DataFrame) -> None:
     st.subheader("Missingness by column")
     missingness_by_column = report["missingness_by_column"]
     st.dataframe(missingness_by_column, hide_index=True, width="stretch")
 
-    if not missingness_by_column.empty:
-        chart_data = missingness_by_column.set_index("column_name")["missing_percent"]
-        st.bar_chart(chart_data)
+    if not df.empty and len(df.columns):
+        st.plotly_chart(plot_missingness_heatmap(df), width="stretch")
+        if len(df) > 250:
+            st.caption("Heatmap shows the first 250 dataset rows; the table covers all rows.")
 
     st.subheader("Rows with missing values")
     missingness_by_row = report["missingness_by_row"].head(50)
@@ -404,7 +429,8 @@ def _render_duplicate_checks(report: dict[str, Any]) -> None:
                 "Metric": "Example duplicate row indices",
                 "Value": ", ".join(str(index) for index in duplicate_rows["example_duplicate_indices"]) or "None",
             },
-        ]
+        ],
+        dtype=str,
     )
     st.markdown("**Exact duplicate rows**")
     st.dataframe(duplicate_row_summary, hide_index=True, width="stretch")
@@ -424,9 +450,37 @@ def _render_duplicate_checks(report: dict[str, Any]) -> None:
                 "Metric": "Example duplicate IDs",
                 "Value": ", ".join(duplicate_ids["duplicate_id_examples"]) or "None",
             },
-        ]
+        ],
+        dtype=str,
     )
     st.dataframe(duplicate_id_summary, hide_index=True, width="stretch")
+
+
+def _render_clinical_value_checks(report: dict[str, Any]) -> None:
+    st.subheader("Age and date checks")
+    age_quality = report["age_quality"]
+    date_quality = report["date_quality"]
+
+    st.markdown("**Age range (0–120)**")
+    if age_quality["checked"]:
+        st.dataframe(age_quality["details"], hide_index=True, width="stretch")
+    else:
+        st.info("No age column was identified. Annotate a column as Age to check it.")
+
+    st.markdown("**Date parsing**")
+    if date_quality["checked"]:
+        st.dataframe(date_quality["parsing"], hide_index=True, width="stretch")
+    else:
+        st.info("No date columns were identified.")
+
+    st.markdown("**Date consistency**")
+    if date_quality["consistency"].empty:
+        st.info(
+            "Select survival date columns, or annotate start and end dates, "
+            "to run chronology checks."
+        )
+    else:
+        st.dataframe(date_quality["consistency"], hide_index=True, width="stretch")
 
 
 def _render_survival_quality_section(report: dict[str, Any]) -> None:
@@ -467,7 +521,8 @@ def _render_survival_quality_section(report: dict[str, Any]) -> None:
                 "Metric": "Unmapped event values",
                 "Value": ", ".join(survival_quality["unmapped_event_values"]) or "None",
             },
-        ]
+        ],
+        dtype=str,
     )
     st.dataframe(survival_summary, hide_index=True, width="stretch")
 
@@ -515,10 +570,20 @@ def _render_cohort_overview_tab() -> None:
         return
 
     time_unit = getattr(survival_config, "time_unit", "unknown") if survival_config is not None else "unknown"
+    role_columns = get_cohort_role_columns(uploaded_df, annotations)
+    configured_id_col = getattr(survival_config, "id_col", None)
+    id_col = (
+        configured_id_col
+        if configured_id_col in uploaded_df.columns
+        else next(iter(role_columns["patient_id"]), None)
+    )
+    age_col = next(iter(role_columns["age"]), None)
     metrics = compute_cohort_overview_metrics(
         uploaded_df,
         survival_ready_df=survival_ready_df,
         time_unit=time_unit,
+        id_col=id_col,
+        age_col=age_col,
     )
     inferred_variables = get_default_baseline_variables(uploaded_df, profile_df, survival_config)
     default_variables = _annotated_baseline_variables(
@@ -529,6 +594,11 @@ def _render_cohort_overview_tab() -> None:
     variable_type_summary = count_variable_types(uploaded_df, profile_df, survival_config)
 
     _render_cohort_summary_cards(metrics)
+    _render_key_cohort_characteristics(
+        uploaded_df,
+        profile_df,
+        role_columns,
+    )
     _render_cohort_mapping_summary(survival_config)
 
     st.subheader("Variable type summary")
@@ -563,8 +633,18 @@ def _render_cohort_overview_tab() -> None:
 
     st.subheader("Baseline characteristics")
     if not continuous_vars and not categorical_vars:
-        st.info("No variables selected for baseline table.")
-        return
+        st.info("No characteristics selected; Table 1 still includes cohort and survival rows.")
+
+    grouped_survival_df = (
+        _survival_dataframe_for_group(
+            uploaded_df,
+            survival_config,
+            survival_ready_df,
+            group_col,
+        )
+        if survival_config is not None and survival_ready_df is not None
+        else survival_ready_df
+    )
 
     baseline_table = build_baseline_table(
         uploaded_df,
@@ -574,6 +654,8 @@ def _render_cohort_overview_tab() -> None:
         max_levels=max_levels,
         include_missing=include_missing,
         group_value_labels=_group_value_labels_for_column(group_col),
+        survival_ready_df=grouped_survival_df,
+        id_col=id_col,
     )
     st.dataframe(baseline_table, hide_index=True, width="stretch")
     st.download_button(
@@ -586,26 +668,121 @@ def _render_cohort_overview_tab() -> None:
 
 def _render_cohort_summary_cards(metrics: dict[str, Any]) -> None:
     first_row = st.columns(4)
-    first_row[0].metric("Rows", metrics["n_rows"])
-    first_row[1].metric("Columns", metrics["n_columns"])
-    first_row[2].metric(
-        "Complete rows",
-        f"{metrics['complete_rows']} ({_format_number(metrics['complete_rows_percent'])}%)",
-    )
-    first_row[3].metric("Missing cells %", f"{_format_number(metrics['missing_cells_percent'])}%")
+    first_row[0].metric("Total patients", metrics["n_patients"])
+    first_row[1].metric("Rows", metrics["n_rows"])
+    first_row[2].metric("Events", _metric_value(metrics["events"]))
+    first_row[3].metric("Censored", _metric_value(metrics["censored"]))
 
-    second_row = st.columns(5)
-    second_row[0].metric("Usable survival rows", _metric_value(metrics["usable_survival_rows"]))
-    second_row[1].metric("Events", _metric_value(metrics["events"]))
-    second_row[2].metric("Censored", _metric_value(metrics["censored"]))
-    second_row[3].metric(
+    second_row = st.columns(4)
+    second_row[0].metric(
         "Event rate",
         "Not available" if metrics["event_rate"] is None else f"{_format_number(metrics['event_rate'])}%",
     )
-    second_row[4].metric(
+    second_row[1].metric(
         "Median follow-up",
         _format_time_value(metrics["median_followup"], metrics["time_unit"]),
     )
+    second_row[2].metric(
+        "Median age",
+        (
+            "Not available"
+            if metrics["median_age"] is None
+            else _format_number(metrics["median_age"])
+        ),
+    )
+    second_row[3].metric(
+        "Complete rows",
+        f"{metrics['complete_rows']} ({_format_number(metrics['complete_rows_percent'])}%)",
+    )
+
+    st.caption(
+        f"Patient count: {metrics['patient_count_basis']}. "
+        f"Missing cells: {_format_number(metrics['missing_cells_percent'])}%."
+    )
+    if metrics["missing_patient_ids"]:
+        st.warning(
+            f"{metrics['missing_patient_ids']} row(s) have no patient ID and are excluded "
+            "from the distinct patient count."
+        )
+
+
+def _render_key_cohort_characteristics(
+    df: pd.DataFrame,
+    profile_df: pd.DataFrame | None,
+    role_columns: dict[str, list[str]],
+) -> None:
+    st.subheader("Key cohort characteristics")
+    st.caption("These summaries follow the meanings saved in Column annotations.")
+    rendered = False
+
+    for column in role_columns["age"]:
+        rendered = True
+        with st.expander(f"Age: {column}", expanded=True):
+            summary = summarize_continuous_variable(df, column)
+            summary_row = st.columns(4)
+            summary_row[0].metric("Valid values", summary["n"])
+            summary_row[1].metric("Median", _metric_value(summary["median"]))
+            summary_row[2].metric("Mean", _metric_value(summary["mean"]))
+            summary_row[3].metric(
+                "Range",
+                (
+                    "Not available"
+                    if summary["min"] is None
+                    else f"{_format_number(summary['min'])}–{_format_number(summary['max'])}"
+                ),
+            )
+            result = build_chart(
+                df,
+                chart_type="histogram",
+                x_col=column,
+                profile_df=profile_df,
+            )
+            if result["fig"] is not None:
+                st.plotly_chart(result["fig"], width="stretch")
+            for warning in result["warnings"]:
+                st.warning(warning)
+
+    categorical_roles = [
+        ("sex", "Sex / gender"),
+        ("diagnosis", "Diagnosis"),
+        ("treatment", "Treatment"),
+        ("outcome", "Outcome"),
+    ]
+    for role, label in categorical_roles:
+        for column in role_columns[role]:
+            rendered = True
+            with st.expander(f"{label}: {column}"):
+                summary = summarize_categorical_variable(
+                    df,
+                    column,
+                    max_levels=20,
+                    include_missing=True,
+                )
+                st.dataframe(
+                    summary[["level", "count", "percent"]].rename(
+                        columns={"level": "Level", "count": "n", "percent": "%"}
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+                result = build_chart(
+                    df,
+                    chart_type="bar",
+                    x_col=column,
+                    profile_df=profile_df,
+                    max_category_levels=20,
+                    include_missing=True,
+                )
+                if result["fig"] is not None:
+                    st.plotly_chart(result["fig"], width="stretch")
+                for warning in result["warnings"]:
+                    st.warning(warning)
+
+    if not rendered:
+        st.info(
+            "No age, sex/gender, diagnosis, treatment, or outcome columns are annotated. "
+            "Update Column annotations on Upload to add these summaries."
+        )
 
 
 def _render_cohort_mapping_summary(survival_config: SurvivalConfig | None) -> None:
@@ -617,17 +794,43 @@ def _render_cohort_mapping_summary(survival_config: SurvivalConfig | None) -> No
         return
 
     st.markdown("**Survival mapping**")
-    mapping_summary = pd.DataFrame(
-        [
+    if survival_config.time_source == "dates":
+        mapping_rows = [
+            {"Field": "time", "Value": "Derived from dates"},
+            {"Field": "start date", "Value": survival_config.start_date_col},
+            {"Field": "event date", "Value": survival_config.event_date_col},
+            {
+                "Field": "last follow-up date",
+                "Value": survival_config.last_followup_date_col,
+            },
+            {
+                "Field": "missing event dates",
+                "Value": (
+                    "Censor at last follow-up"
+                    if survival_config.missing_event_handling == "treat_as_censored"
+                    else "Exclude"
+                ),
+            },
+            {"Field": "group", "Value": survival_config.group_col or "None"},
+            {"Field": "time unit", "Value": survival_config.time_unit},
+        ]
+    else:
+        mapping_rows = [
             {"Field": "time", "Value": survival_config.time_col},
             {"Field": "event", "Value": survival_config.event_col},
             {
                 "Field": "event values",
-                "Value": ", ".join(_format_value(value) for value in survival_config.event_values),
+                "Value": ", ".join(
+                    _format_value(value)
+                    for value in survival_config.event_values
+                ),
             },
             {
                 "Field": "censored values",
-                "Value": ", ".join(_format_value(value) for value in survival_config.censor_values),
+                "Value": ", ".join(
+                    _format_value(value)
+                    for value in survival_config.censor_values
+                ),
             },
             {
                 "Field": "unmapped values",
@@ -644,6 +847,8 @@ def _render_cohort_mapping_summary(survival_config: SurvivalConfig | None) -> No
             {"Field": "group", "Value": survival_config.group_col or "None"},
             {"Field": "time unit", "Value": survival_config.time_unit},
         ]
+    mapping_summary = pd.DataFrame(
+        mapping_rows
     )
     st.dataframe(mapping_summary, hide_index=True, width="stretch")
 
@@ -972,6 +1177,9 @@ def _render_chart_survival_mapping_note(
     survival_roles = {
         survival_config.time_col: "time",
         survival_config.event_col: "event",
+        survival_config.start_date_col: "start date",
+        survival_config.event_date_col: "event date",
+        survival_config.last_followup_date_col: "last follow-up date",
         survival_config.id_col: "patient ID",
         survival_config.group_col: "group",
     }
@@ -1225,12 +1433,39 @@ def _survival_dataframe_for_group(
 
 def _render_current_mapping(config: SurvivalConfig) -> None:
     st.markdown("**Current survival mapping**")
-    mapping_df = pd.DataFrame(
-        [
+    if config.time_source == "dates":
+        mapping_rows = [
+            {"Field": "Time", "Value": "Derived from dates"},
+            {"Field": "Start date column", "Value": config.start_date_col},
+            {"Field": "Event date column", "Value": config.event_date_col},
+            {
+                "Field": "Last follow-up date column",
+                "Value": config.last_followup_date_col,
+            },
+            {
+                "Field": "Missing event dates",
+                "Value": (
+                    "Censor at last follow-up"
+                    if config.missing_event_handling == "treat_as_censored"
+                    else "Exclude"
+                ),
+            },
+            {"Field": "Patient ID column", "Value": config.id_col or "Row number"},
+            {"Field": "Group column", "Value": config.group_col or "None"},
+            {"Field": "Time unit", "Value": config.time_unit},
+        ]
+    else:
+        mapping_rows = [
             {"Field": "Time column", "Value": config.time_col},
             {"Field": "Event column", "Value": config.event_col},
-            {"Field": "Event values", "Value": ", ".join(_format_value(value) for value in config.event_values)},
-            {"Field": "Censor values", "Value": ", ".join(_format_value(value) for value in config.censor_values)},
+            {
+                "Field": "Event values",
+                "Value": ", ".join(_format_value(value) for value in config.event_values),
+            },
+            {
+                "Field": "Censor values",
+                "Value": ", ".join(_format_value(value) for value in config.censor_values),
+            },
             {
                 "Field": "Unmapped values",
                 "Value": _format_event_handling(
@@ -1245,6 +1480,8 @@ def _render_current_mapping(config: SurvivalConfig) -> None:
             {"Field": "Group column", "Value": config.group_col or "None"},
             {"Field": "Time unit", "Value": config.time_unit},
         ]
+    mapping_df = pd.DataFrame(
+        mapping_rows
     )
     st.dataframe(mapping_df, hide_index=True, width="stretch")
 
@@ -1416,32 +1653,94 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
     role_suggestions = suggest_survival_roles(profile)
     all_columns = [str(column) for column in df.columns]
 
-    time_col = _select_required_role_column(
-        "Follow-up / survival time column",
-        role_suggestions["time_candidates"],
-        all_columns,
-        "time_col",
+    time_source_label = st.radio(
+        "Survival time setup",
+        ["Use a follow-up duration column", "Derive from date columns"],
+        horizontal=True,
+        key="survival_time_source",
     )
-
-    event_col = _select_required_role_column(
-        "Event/status column",
-        role_suggestions["event_candidates"],
-        all_columns,
-        "event_col",
-    )
-
+    time_source = "dates" if time_source_label == "Derive from date columns" else "duration"
+    time_col: str | None = None
+    event_col: str | None = None
+    start_date_col: str | None = None
+    event_date_col: str | None = None
+    last_followup_date_col: str | None = None
     event_values: list[Any] = []
     censor_values: list[Any] = []
     missing_event_handling = "exclude"
     unmapped_event_handling = "exclude"
 
-    if event_col:
-        (
-            event_values,
-            censor_values,
-            missing_event_handling,
-            unmapped_event_handling,
-        ) = _render_event_value_mapping(df, event_col)
+    if time_source == "duration":
+        time_col = _select_required_role_column(
+            "Follow-up / survival time column",
+            role_suggestions["time_candidates"],
+            all_columns,
+            "time_col",
+        )
+        event_col = _select_required_role_column(
+            "Event/status column",
+            role_suggestions["event_candidates"],
+            all_columns,
+            "event_col",
+        )
+        if event_col:
+            (
+                event_values,
+                censor_values,
+                missing_event_handling,
+                unmapped_event_handling,
+            ) = _render_event_value_mapping(df, event_col)
+        time_unit = _render_time_unit_selector(time_col or "")
+    else:
+        st.caption(
+            "Duration is calculated in days: event date minus start date, or last follow-up "
+            "minus start date when the event date is missing."
+        )
+        date_columns = profile.loc[
+            profile["detected_type"] == "date",
+            "column_name",
+        ].astype(str).tolist()
+        date_options = date_columns + [
+            column for column in all_columns if column not in date_columns
+        ]
+        start_date_col = st.selectbox(
+            "Start date column",
+            date_options,
+            index=_suggest_date_column_index(date_options, ("start", "diagnosis", "enroll", "index")),
+            key="start_date_col_dates",
+        )
+        event_date_col = st.selectbox(
+            "Event date column",
+            date_options,
+            index=_suggest_date_column_index(date_options, ("event", "death", "relapse", "progress")),
+            key="event_date_col_dates",
+        )
+        last_followup_date_col = st.selectbox(
+            "Last follow-up date column",
+            date_options,
+            index=_suggest_date_column_index(
+                date_options,
+                ("last_follow", "last follow", "last_contact", "last contact", "last_seen"),
+            ),
+            key="last_followup_date_col_dates",
+        )
+        missing_date_choice = st.radio(
+            "How should missing event dates be interpreted?",
+            [
+                "Unknown / exclude from survival analysis",
+                "Censored / event did not occur before last follow-up",
+            ],
+            index=0,
+            key=f"missing_event_handling_{event_date_col}",
+            help="Exclusion is the conservative default.",
+        )
+        missing_event_handling = (
+            "treat_as_censored"
+            if missing_date_choice.startswith("Censored")
+            else "exclude"
+        )
+        time_unit = "days"
+        st.caption("Time unit: days")
 
     id_col = _select_optional_role_column(
         "Patient ID column",
@@ -1459,8 +1758,6 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
         "group_col",
     )
 
-    time_unit = _render_time_unit_selector(time_col)
-
     if st.button("Confirm survival mapping", type="primary"):
         config = SurvivalConfig(
             time_col=time_col,
@@ -1472,6 +1769,10 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
             time_unit=time_unit,
             missing_event_handling=missing_event_handling,
             unmapped_event_handling=unmapped_event_handling,
+            time_source=time_source,
+            start_date_col=start_date_col,
+            event_date_col=event_date_col,
+            last_followup_date_col=last_followup_date_col,
         )
         errors, warnings = validate_survival_config(df, config)
 
@@ -1827,6 +2128,14 @@ def _render_time_unit_selector(time_col: str) -> str:
             key=f"time_unit_{time_col}",
         )
     )
+
+
+def _suggest_date_column_index(columns: list[str], markers: tuple[str, ...]) -> int:
+    for index, column in enumerate(columns):
+        normalized = column.lower().replace("-", "_")
+        if any(marker in normalized for marker in markers):
+            return index
+    return 0
 
 
 def _unique_non_missing_values(df: pd.DataFrame, column: str) -> list[Any]:

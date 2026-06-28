@@ -4,6 +4,7 @@ from src.cohort_overview import (
     build_baseline_table,
     classify_summary_variable,
     compute_cohort_overview_metrics,
+    get_cohort_role_columns,
     get_default_baseline_variables,
     summarize_categorical_by_group,
     summarize_categorical_variable,
@@ -55,6 +56,58 @@ def test_compute_cohort_overview_metrics_without_survival_mapping_sets_survival_
     assert metrics["censored"] is None
     assert metrics["event_rate"] is None
     assert metrics["median_followup"] is None
+
+
+def test_compute_cohort_overview_metrics_counts_distinct_patient_ids_and_median_age():
+    df = pd.DataFrame(
+        {
+            "patient_id": ["P1", "P1", "P2", None],
+            "age": [40, 40, 60, 80],
+        }
+    )
+
+    metrics = compute_cohort_overview_metrics(
+        df,
+        id_col="patient_id",
+        age_col="age",
+    )
+
+    assert metrics["n_patients"] == 2
+    assert metrics["patient_count_basis"] == "Distinct patient_id"
+    assert metrics["missing_patient_ids"] == 1
+    assert metrics["median_age"] == 50.0
+
+
+def test_get_cohort_role_columns_uses_saved_semantic_annotations():
+    from src.column_annotations import ColumnAnnotation
+
+    df = pd.DataFrame(
+        {
+            "record": ["P1"],
+            "years": [55],
+            "gender_code": ["F"],
+            "condition": ["NSCLC"],
+            "arm_code": ["A"],
+            "response_code": ["CR"],
+        }
+    )
+    annotations = {
+        "record": ColumnAnnotation("record", "Patient ID"),
+        "years": ColumnAnnotation("years", "Age"),
+        "gender_code": ColumnAnnotation("gender_code", "Sex / gender"),
+        "condition": ColumnAnnotation("condition", "Diagnosis"),
+        "arm_code": ColumnAnnotation("arm_code", "Treatment / exposure group"),
+        "response_code": ColumnAnnotation("response_code", "Outcome other than survival"),
+    }
+
+    assert get_cohort_role_columns(df, annotations) == {
+        "patient_id": ["record"],
+        "age": ["years"],
+        "sex": ["gender_code"],
+        "diagnosis": ["condition"],
+        "treatment": ["arm_code"],
+        "outcome": ["response_code"],
+    }
 
 
 def test_classify_summary_variable_honors_survival_mapping_and_clinical_ordinal_hints():
@@ -217,5 +270,50 @@ def test_build_baseline_table_does_not_repeat_grouping_variable():
         group_col="sex",
     )
 
-    assert table["Variable"].tolist() == ["age"]
+    assert table["Variable"].tolist() == [
+        "n",
+        "Events, n (%)",
+        "Follow-up, median [IQR]",
+        "age",
+    ]
     assert table.columns.tolist() == ["Variable", "Overall", "F", "M"]
+
+
+def test_build_baseline_table_starts_with_patient_event_and_followup_rows():
+    df = pd.DataFrame(
+        {
+            "patient_id": ["P1", "P1", "P2", "P3", None],
+            "arm": ["A", "A", "A", "B", "B"],
+        }
+    )
+    survival_df = pd.DataFrame(
+        {
+            "_time": [10, 20, 30, 40],
+            "_event": [1, 0, 1, 0],
+            "_group": ["A", "A", "B", "B"],
+        }
+    )
+
+    table = build_baseline_table(
+        df,
+        continuous_vars=[],
+        categorical_vars=[],
+        group_col="arm",
+        survival_ready_df=survival_df,
+        id_col="patient_id",
+    )
+
+    assert table["Variable"].tolist() == [
+        "n",
+        "Events, n (%)",
+        "Follow-up, median [IQR]",
+    ]
+    assert table.loc[table["Variable"] == "n"].iloc[0].to_dict() == {
+        "Variable": "n",
+        "Overall": "3",
+        "A": "2",
+        "B": "1",
+    }
+    assert table.loc[table["Variable"] == "Events, n (%)", "Overall"].iloc[0] == "2 (50.00%)"
+    assert table.loc[table["Variable"] == "Events, n (%)", "A"].iloc[0] == "1 (50.00%)"
+    assert table.loc[table["Variable"] == "Follow-up, median [IQR]", "B"].iloc[0] == "35 [32.50, 37.50]"
