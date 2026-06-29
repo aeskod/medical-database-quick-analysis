@@ -8,6 +8,7 @@ def plot_km_curve(
     title: str = "Kaplan-Meier Survival Curve",
     time_unit: str = "unknown",
     show_ci: bool = True,
+    show_censors: bool = True,
 ) -> go.Figure:
     fig = go.Figure()
 
@@ -49,6 +50,26 @@ def plot_km_curve(
                 ),
             )
         )
+
+        if show_censors and "censored" in ordered_group_df:
+            censored = ordered_group_df[ordered_group_df["censored"] > 0]
+            if not censored.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=censored["time"],
+                        y=censored["survival"],
+                        mode="markers",
+                        marker={"color": color, "size": 10, "symbol": "line-ns-open"},
+                        name=f"{group} censored",
+                        showlegend=False,
+                        customdata=censored["censored"],
+                        hovertemplate=(
+                            "Censored at %{x}: %{customdata}<br>"
+                            "Survival probability: %{y:.3f}"
+                            f"<extra>{group}</extra>"
+                        ),
+                    )
+                )
 
     _style_figure(fig, title, time_unit)
     return fig

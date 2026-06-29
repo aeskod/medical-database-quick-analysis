@@ -10,9 +10,10 @@ from src.profiling import normalize_missing_values, profile_dataframe
 
 CHART_TYPE_OPTIONS = {
     "Auto": "auto",
-    "Histogram": "histogram",
+    "Histogram + box plot": "histogram",
     "Bar chart": "bar",
     "Box plot": "box",
+    "Violin plot": "violin",
     "Scatter plot": "scatter",
     "Stacked bar chart": "stacked_bar",
     "Correlation heatmap": "correlation_heatmap",
@@ -177,7 +178,7 @@ def explain_chart_recommendation(
     y_type = get_chart_variable_type(y_col, df, profile_df) if y_col is not None else None
 
     if resolved_chart_type == "histogram":
-        return f"{x_col} is numeric, so a histogram is recommended."
+        return f"{x_col} is numeric, so a histogram with a marginal box plot is recommended."
     if resolved_chart_type == "bar":
         return f"{x_col} is categorical, so a bar chart is recommended."
     if resolved_chart_type == "box" and y_col is not None:
@@ -193,6 +194,52 @@ def explain_chart_recommendation(
 def prepare_numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
     normalized = normalize_missing_values(df[[column]])[column]
     return pd.to_numeric(normalized, errors="coerce").dropna()
+
+
+def summarize_chart_variables(
+    df: pd.DataFrame,
+    columns: list[str | None],
+    profile_df: pd.DataFrame | None = None,
+) -> dict[str, dict[str, str]]:
+    summaries = {}
+    for column in dict.fromkeys(column for column in columns if column in df.columns):
+        normalized = normalize_missing_values(df[[column]])[column]
+        variable_type = get_chart_variable_type(column, df, profile_df)
+        missing = int(normalized.isna().sum())
+
+        if variable_type == "numeric":
+            values = pd.to_numeric(normalized, errors="coerce").dropna()
+            if values.empty:
+                continue
+            sd = values.std()
+            summaries[column] = {
+                "Type": "Numeric",
+                "Valid": str(len(values)),
+                "Missing": str(missing),
+                "Mean": _format_stat(values.mean()),
+                "SD": _format_stat(0 if pd.isna(sd) else sd),
+                "Median": _format_stat(values.median()),
+                "IQR": f"{_format_stat(values.quantile(0.25))}–{_format_stat(values.quantile(0.75))}",
+                "Range": f"{_format_stat(values.min())}–{_format_stat(values.max())}",
+            }
+        elif variable_type == "categorical":
+            values = normalized.dropna().astype(str)
+            if values.empty:
+                continue
+            counts = values.value_counts()
+            top_value = str(counts.index[0])
+            top_count = int(counts.iloc[0])
+            summaries[column] = {
+                "Type": "Categorical",
+                "Valid": str(len(values)),
+                "Missing": str(missing),
+                "Levels": str(values.nunique()),
+                "Most common": (
+                    f"{top_value} — {top_count} "
+                    f"({_format_stat(top_count / len(values) * 100)}%)"
+                ),
+            }
+    return summaries
 
 
 def prepare_categorical_series(
@@ -292,6 +339,7 @@ def plot_histogram(
         x=x_col,
         color=color_col if color_col in plot_df.columns else None,
         nbins=nbins,
+        marginal="box",
         title=title or f"Distribution of {x_col}",
     )
     _style_figure(fig)
@@ -390,6 +438,57 @@ def plot_box_plot(
         color=color_col if color_col in plot_df.columns else None,
         title=title or f"{numeric_col} by {category_col}",
         points="outliers",
+    )
+    _style_figure(fig)
+    return fig
+
+
+def plot_violin(
+    df: pd.DataFrame,
+    numeric_col: str,
+    category_col: str | None = None,
+    color_col: str | None = None,
+    max_levels: int = 20,
+    title: str | None = None,
+    include_missing: bool = True,
+) -> go.Figure:
+    selected_columns = list(
+        dict.fromkeys(
+            [numeric_col]
+            + ([category_col] if category_col else [])
+            + ([color_col] if color_col else [])
+        )
+    )
+    plot_df = normalize_missing_values(df[selected_columns])
+    plot_df[numeric_col] = pd.to_numeric(plot_df[numeric_col], errors="coerce")
+    plot_df = plot_df.dropna(subset=[numeric_col])
+
+    for column in [category_col, color_col]:
+        if column and column != numeric_col:
+            plot_df[column] = prepare_categorical_series(
+                plot_df,
+                column,
+                max_levels=max_levels,
+                include_missing=include_missing,
+            )
+
+    group_col = category_col or (
+        color_col
+        if color_col and get_chart_variable_type(color_col, df) == "categorical"
+        else None
+    )
+    fig = px.violin(
+        plot_df,
+        x=group_col,
+        y=numeric_col,
+        color=color_col if color_col in plot_df.columns else None,
+        box=True,
+        points="outliers",
+        title=title or (
+            f"Distribution of {numeric_col}"
+            if group_col is None
+            else f"{numeric_col} by {group_col}"
+        ),
     )
     _style_figure(fig)
     return fig
@@ -654,6 +753,27 @@ def build_chart(
                 include_missing=include_missing,
             )
 
+        elif resolved_chart_type == "violin":
+            numeric_col, category_col = _resolve_violin_columns(
+                df,
+                x_col,
+                y_col,
+                profile_df,
+            )
+            if numeric_col is None:
+                warnings.append(
+                    "Violin plot requires one numeric variable and an optional categorical variable."
+                )
+                return {"fig": None, "chart_type": resolved_chart_type, "warnings": warnings}
+            fig = plot_violin(
+                df,
+                numeric_col=numeric_col,
+                category_col=category_col,
+                color_col=color_col,
+                max_levels=max_category_levels,
+                include_missing=include_missing,
+            )
+
         elif resolved_chart_type == "scatter":
             if (
                 x_col is None
@@ -779,6 +899,19 @@ def _resolve_box_columns(
     return None, None
 
 
+def _resolve_violin_columns(
+    df: pd.DataFrame,
+    x_col: str | None,
+    y_col: str | None,
+    profile_df: pd.DataFrame | None,
+) -> tuple[str | None, str | None]:
+    if x_col is not None and y_col is None:
+        if get_chart_variable_type(x_col, df, profile_df) == "numeric":
+            return x_col, None
+        return None, None
+    return _resolve_box_columns(df, x_col, y_col, profile_df)
+
+
 def _numeric_chart_columns(df: pd.DataFrame) -> list[str]:
     profile = profile_dataframe(df)
     return [
@@ -871,6 +1004,11 @@ def _looks_like_free_text(series: pd.Series) -> bool:
 
     unique_ratio = text_values.nunique(dropna=True) / len(text_values)
     return text_values.str.len().mean() > TEXT_LENGTH_THRESHOLD or unique_ratio > 0.8
+
+
+def _format_stat(value: Any) -> str:
+    numeric = float(value)
+    return str(int(numeric)) if numeric.is_integer() else f"{numeric:.2f}"
 
 
 def _style_figure(fig: go.Figure) -> None:

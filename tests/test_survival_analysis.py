@@ -18,6 +18,7 @@ from src.survival_analysis import (
     run_logrank_test,
     run_pairwise_logrank_tests,
     suggest_timepoints,
+    survival_probabilities_at_years,
     survival_probability_at_times,
     survival_probability_table_by_group,
     validate_survival_ready_dataframe,
@@ -87,6 +88,22 @@ def test_survival_probability_at_times():
     assert probabilities["survival_probability"].between(0, 1).all()
 
 
+def test_survival_probabilities_at_years_respects_units_and_followup():
+    df = pd.DataFrame({"_time": [6, 12, 24, 36, 48], "_event": [1, 0, 1, 0, 1]})
+    result = fit_km_overall(df)
+
+    probabilities = survival_probabilities_at_years(result["kmf"], "months")
+
+    assert probabilities[1] == round(float(result["kmf"].predict(12)), 4)
+    assert probabilities[3] == round(float(result["kmf"].predict(36)), 4)
+    assert probabilities[5] is None
+    assert survival_probabilities_at_years(result["kmf"], "unknown") == {
+        1: None,
+        3: None,
+        5: None,
+    }
+
+
 def test_fit_km_by_group_returns_two_groups():
     df = pd.DataFrame(
         {
@@ -138,6 +155,27 @@ def test_plot_km_curve_returns_figure():
     figure = plot_km_curve(curve_df)
 
     assert isinstance(figure, go.Figure)
+
+
+def test_plot_km_curve_censor_markers_can_be_toggled():
+    curve_df = pd.DataFrame(
+        {
+            "time": [0, 10, 20],
+            "survival": [1.0, 0.8, 0.8],
+            "ci_lower": [1.0, 0.7, 0.7],
+            "ci_upper": [1.0, 0.9, 0.9],
+            "censored": [0, 0, 2],
+            "group": ["Overall", "Overall", "Overall"],
+        }
+    )
+
+    with_censors = plot_km_curve(curve_df)
+    without_censors = plot_km_curve(curve_df, show_censors=False)
+
+    marker_trace = next(trace for trace in with_censors.data if trace.mode == "markers")
+    assert list(marker_trace.x) == [20]
+    assert list(marker_trace.customdata) == [2]
+    assert all(trace.mode != "markers" for trace in without_censors.data)
 
 
 def test_format_p_value():

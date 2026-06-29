@@ -13,8 +13,10 @@ from src.charts import (
     plot_missingness_bar,
     plot_missingness_heatmap,
     plot_scatter,
+    plot_violin,
     prepare_categorical_series,
     recommend_chart_type,
+    summarize_chart_variables,
 )
 
 
@@ -115,10 +117,13 @@ def test_build_chart_dataframe_does_not_mutate_input_and_drops_required_numeric_
     pd.testing.assert_frame_equal(df, original)
 
 
-def test_histogram_returns_figure():
+def test_histogram_includes_marginal_box_plot():
     df = pd.DataFrame({"age": [50, 60, 70, 80]})
 
-    assert isinstance(plot_histogram(df, "age"), go.Figure)
+    figure = plot_histogram(df, "age")
+
+    assert isinstance(figure, go.Figure)
+    assert {trace.type for trace in figure.data} == {"histogram", "box"}
 
 
 def test_bar_chart_returns_figure():
@@ -131,6 +136,48 @@ def test_box_plot_returns_figure():
     df = pd.DataFrame({"age": [50, 60, 70, 80], "sex": ["M", "F", "M", "F"]})
 
     assert isinstance(plot_box_plot(df, numeric_col="age", category_col="sex"), go.Figure)
+
+
+def test_violin_plot_supports_one_numeric_or_numeric_by_category():
+    df = pd.DataFrame({"age": [50, 60, 70, 80], "sex": ["M", "F", "M", "F"]})
+
+    numeric_figure = plot_violin(df, numeric_col="age")
+    grouped_figure = plot_violin(df, numeric_col="age", category_col="sex")
+
+    assert isinstance(numeric_figure, go.Figure)
+    assert isinstance(grouped_figure, go.Figure)
+    assert all(trace.type == "violin" for trace in numeric_figure.data)
+    assert all(trace.type == "violin" for trace in grouped_figure.data)
+
+
+def test_summarize_chart_variables_returns_numeric_and_categorical_statistics():
+    df = pd.DataFrame(
+        {
+            "age": [50, 60, None, 80],
+            "sex": ["F", "F", "M", None],
+        }
+    )
+
+    summaries = summarize_chart_variables(df, ["age", "sex", "age"])
+
+    assert list(summaries) == ["age", "sex"]
+    assert summaries["age"] == {
+        "Type": "Numeric",
+        "Valid": "3",
+        "Missing": "1",
+        "Mean": "63.33",
+        "SD": "15.28",
+        "Median": "60",
+        "IQR": "55–70",
+        "Range": "50–80",
+    }
+    assert summaries["sex"] == {
+        "Type": "Categorical",
+        "Valid": "3",
+        "Missing": "1",
+        "Levels": "2",
+        "Most common": "F — 2 (66.67%)",
+    }
 
 
 def test_scatter_returns_figure():
@@ -221,7 +268,7 @@ def test_correlation_heatmap_requires_two_numeric_columns():
     assert any("requires at least two numeric variables" in warning for warning in result["warnings"])
 
 
-def test_build_chart_auto_returns_histogram():
+def test_build_chart_auto_returns_histogram_with_box_plot():
     df = pd.DataFrame({"age": [50, 60, 70], "sex": ["M", "F", "M"]})
 
     result = build_chart(df=df, chart_type="auto", x_col="age", y_col=None)
@@ -229,3 +276,19 @@ def test_build_chart_auto_returns_histogram():
     assert result["chart_type"] == "histogram"
     assert isinstance(result["fig"], go.Figure)
     assert isinstance(result["warnings"], list)
+
+
+def test_build_chart_returns_violin_for_valid_variables():
+    df = pd.DataFrame({"age": [50, 60, 70, 80], "sex": ["M", "F", "M", "F"]})
+
+    result = build_chart(
+        df=df,
+        chart_type="violin",
+        x_col="age",
+        y_col="sex",
+    )
+
+    assert result["chart_type"] == "violin"
+    assert isinstance(result["fig"], go.Figure)
+    assert all(trace.type == "violin" for trace in result["fig"].data)
+    assert result["warnings"] == []

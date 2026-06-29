@@ -28,6 +28,7 @@ from src.charts import (
     explain_chart_recommendation,
     get_chart_variable_type,
     plot_missingness_heatmap,
+    summarize_chart_variables,
 )
 from src.data_quality import (
     build_data_quality_report,
@@ -47,6 +48,12 @@ from src.data_loading import (
     DatasetMetadata,
     read_dataset_with_metadata,
 )
+from src.exports import (
+    build_html_report,
+    build_pdf_report,
+    deserialize_analysis_configuration,
+    serialize_analysis_configuration,
+)
 from src.profiling import normalize_missing_values, profile_dataframe
 from src.role_suggestions import suggest_survival_roles
 from src.survival_analysis import (
@@ -65,11 +72,13 @@ from src.survival_analysis import (
     run_logrank_test,
     run_pairwise_logrank_tests,
     suggest_timepoints,
+    survival_probabilities_at_years,
     survival_probability_table_by_group,
     validate_survival_ready_dataframe,
 )
 from src.survival_mapping import (
     SurvivalConfig,
+    create_cleaned_mapped_dataframe,
     create_survival_ready_dataframe,
     validate_survival_config,
 )
@@ -97,6 +106,11 @@ DATASET_DERIVED_SESSION_KEYS = {
     "column_annotations",
     "annotation_editor_version",
     "annotation_status_message",
+    "configuration_status_message",
+    "analysis_configuration_upload",
+    "pending_survival_setup_config",
+    "combined_report_html",
+    "combined_report_pdf",
     "show_more_preview_rows",
     "survival_time_source",
 }
@@ -115,6 +129,7 @@ DATASET_DERIVED_SESSION_PREFIXES = (
     "missing_event_handling_",
     "time_unit_",
     "survival_group_label_",
+    "survival_filter_",
     "column_annotation_editor_",
 )
 
@@ -169,6 +184,7 @@ def main() -> None:
                 st.subheader("Survival setup")
                 _render_survival_setup(df, profile)
                 _render_column_annotations(df, profile)
+                _render_export_section(df, profile)
 
     with data_quality_tab:
         _render_data_quality_tab()
@@ -1141,13 +1157,49 @@ def _render_charts_tab() -> None:
         st.warning("Select compatible variables to create a chart.")
         return
 
-    st.plotly_chart(fig, width="stretch")
-    st.download_button(
-        "Download chart as HTML",
-        data=fig.to_html(include_plotlyjs="cdn"),
-        file_name="chart.html",
-        mime="text/html",
+    summaries = summarize_chart_variables(
+        chart_df,
+        [x_col, y_col, color_col],
+        profile_df,
     )
+    if summaries:
+        chart_column, summary_column = st.columns([3, 1])
+        with chart_column:
+            _render_plotly_chart_with_image_export(
+                fig,
+                key="chart_plot_image_format",
+                filename="dashboard_chart",
+            )
+            st.download_button(
+                "Download chart as HTML",
+                data=fig.to_html(include_plotlyjs="cdn"),
+                file_name="chart.html",
+                mime="text/html",
+            )
+        with summary_column:
+            st.subheader("Summary statistics")
+            for column, statistics in summaries.items():
+                st.caption(column)
+                st.dataframe(
+                    pd.DataFrame(
+                        statistics.items(),
+                        columns=["Statistic", "Value"],
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+    else:
+        _render_plotly_chart_with_image_export(
+            fig,
+            key="chart_plot_image_format",
+            filename="dashboard_chart",
+        )
+        st.download_button(
+            "Download chart as HTML",
+            data=fig.to_html(include_plotlyjs="cdn"),
+            file_name="chart.html",
+            mime="text/html",
+        )
 
 
 def _default_chart_x_column(variable_types: dict[str, str]) -> str | None:
@@ -1161,6 +1213,34 @@ def _default_chart_x_column(variable_types: dict[str, str]) -> str | None:
 def _set_default_session_value(key: str, default_value: str, valid_options: list[str]) -> None:
     if st.session_state.get(key) not in valid_options:
         st.session_state[key] = default_value if default_value in valid_options else valid_options[0]
+
+
+def _render_plotly_chart_with_image_export(
+    fig: Any,
+    *,
+    key: str,
+    filename: str,
+) -> None:
+    image_format = st.radio(
+        "Plot image download format",
+        ["PNG", "SVG"],
+        horizontal=True,
+        key=key,
+    )
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        config={
+            "displaylogo": False,
+            "toImageButtonOptions": {
+                "format": image_format.lower(),
+                "filename": filename,
+            },
+        },
+    )
+    st.caption(
+        f"Download this plot as {image_format} with the camera button in the plot toolbar."
+    )
 
 
 def _none_option_to_value(value: str) -> str | None:
@@ -1198,6 +1278,7 @@ def _render_survival_analysis_tab() -> None:
     config = st.session_state.get("survival_config")
     survival_ready_df = st.session_state.get("survival_ready_df")
     uploaded_df = st.session_state.get("uploaded_df")
+    profile_df = st.session_state.get("profile_df")
     annotations = st.session_state.get("column_annotations")
 
     if config is None or survival_ready_df is None:
@@ -1216,10 +1297,12 @@ def _render_survival_analysis_tab() -> None:
             st.markdown(f"- {error}")
         return
 
-    st.success("Survival-ready data validated.")
+    filtered_uploaded_df = _render_survival_filters(uploaded_df, profile_df, annotations)
 
     st.markdown("**Plot controls**")
-    show_ci = st.checkbox("Show confidence interval", value=True)
+    control_columns = st.columns(2)
+    show_ci = control_columns[0].checkbox("Show confidence interval", value=True)
+    show_censors = control_columns[1].checkbox("Show censor marks", value=True)
     group_columns = get_columns_for_use(
         annotations,
         USE_GROUP,
@@ -1241,11 +1324,17 @@ def _render_survival_analysis_tab() -> None:
         None if selected_group_option == "No grouping" else str(selected_group_option)
     )
     survival_ready_df = _survival_dataframe_for_group(
-        uploaded_df,
+        filtered_uploaded_df,
         config,
         survival_ready_df,
         analysis_group_col,
     )
+    filtered_errors, filtered_warnings = validate_survival_ready_dataframe(survival_ready_df)
+    if filtered_errors:
+        st.warning("No analyzable rows remain after applying the current filters.")
+        return
+    st.success("Survival-ready data validated.")
+
     has_group = analysis_group_col is not None and "_group" in survival_ready_df.columns
     use_group = has_group
     if not group_columns:
@@ -1282,6 +1371,7 @@ def _render_survival_analysis_tab() -> None:
     )
     _render_survival_warning_section(
         validation_warnings
+        + filtered_warnings
         + group_warnings
         + interpretation_warnings
         + list(logrank_warnings)
@@ -1291,6 +1381,8 @@ def _render_survival_analysis_tab() -> None:
         summary,
         overall_result["median_survival"],
         config.time_unit,
+        survival_probabilities_at_years(overall_result["kmf"], config.time_unit),
+        logrank_result,
     )
 
     overall_summary_table = compute_overall_survival_summary_table(survival_ready_df, config.time_unit)
@@ -1312,8 +1404,13 @@ def _render_survival_analysis_tab() -> None:
         title=plot_title,
         time_unit=config.time_unit,
         show_ci=show_ci,
+        show_censors=show_censors,
     )
-    st.plotly_chart(fig, width="stretch")
+    _render_plotly_chart_with_image_export(
+        fig,
+        key="survival_plot_image_format",
+        filename="kaplan_meier_curve",
+    )
 
     if use_group and has_group:
         st.subheader("Group-wise survival summary")
@@ -1418,17 +1515,102 @@ def _survival_dataframe_for_group(
     stored_survival_df: pd.DataFrame,
     group_col: str | None,
 ) -> pd.DataFrame:
-    if group_col is None:
-        return stored_survival_df.drop(columns=["_group"], errors="ignore").copy(deep=True)
-
-    if group_col == config.group_col and "_group" in stored_survival_df.columns:
+    if uploaded_df is None:
+        if group_col is None:
+            return stored_survival_df.drop(columns=["_group"], errors="ignore").copy(deep=True)
         return stored_survival_df.copy(deep=True)
-
-    if uploaded_df is None or group_col not in uploaded_df.columns:
-        return stored_survival_df.drop(columns=["_group"], errors="ignore").copy(deep=True)
+    if group_col is not None and group_col not in uploaded_df.columns:
+        return stored_survival_df.copy(deep=True)
 
     analysis_config = replace(config, group_col=group_col)
     return create_survival_ready_dataframe(uploaded_df, analysis_config)
+
+
+def _render_survival_filters(
+    uploaded_df: pd.DataFrame | None,
+    profile_df: pd.DataFrame | None,
+    annotations: Any,
+) -> pd.DataFrame | None:
+    st.subheader("Cohort filters")
+    if uploaded_df is None:
+        return None
+
+    filter_columns = get_columns_for_use(annotations, USE_FILTER, uploaded_df.columns)
+    if not filter_columns:
+        st.caption("No columns are annotated as filters. Update Column annotations on Upload.")
+        return uploaded_df
+
+    detected_types = (
+        profile_df.set_index("column_name")["detected_type"].astype(str).to_dict()
+        if profile_df is not None and not profile_df.empty
+        else {}
+    )
+    selections: dict[str, tuple[str, Any]] = {}
+    for column in filter_columns:
+        series = uploaded_df[column]
+        detected_type = detected_types.get(column, "")
+        if detected_type in {"integer", "float"}:
+            numeric = pd.to_numeric(series, errors="coerce").dropna()
+            if numeric.empty or numeric.min() == numeric.max():
+                st.caption(f"{column}: no variable numeric range")
+                continue
+            lower, upper = float(numeric.min()), float(numeric.max())
+            selected = st.slider(
+                f"Filter by {column}",
+                lower,
+                upper,
+                (lower, upper),
+                key=f"survival_filter_{column}",
+            )
+            if tuple(selected) != (lower, upper):
+                selections[column] = ("numeric", selected)
+        elif detected_type == "date":
+            dates = pd.to_datetime(series, errors="coerce").dropna()
+            if dates.empty or dates.min().date() == dates.max().date():
+                st.caption(f"{column}: no variable date range")
+                continue
+            bounds = (dates.min().date(), dates.max().date())
+            selected = st.date_input(
+                f"Filter by {column}",
+                bounds,
+                min_value=bounds[0],
+                max_value=bounds[1],
+                key=f"survival_filter_{column}",
+            )
+            if len(selected) == 2 and tuple(selected) != bounds:
+                selections[column] = ("date", selected)
+        else:
+            options = sorted(series.dropna().unique().tolist(), key=str)
+            selected = st.multiselect(
+                f"Filter by {column}",
+                options,
+                default=[],
+                help="Leave empty to include all values.",
+                key=f"survival_filter_{column}",
+            )
+            if selected:
+                selections[column] = ("categorical", selected)
+
+    return _apply_survival_filters(uploaded_df, selections)
+
+
+def _apply_survival_filters(
+    df: pd.DataFrame,
+    selections: dict[str, tuple[str, Any]],
+) -> pd.DataFrame:
+    filtered = df.copy(deep=True)
+    for column, (filter_type, value) in selections.items():
+        if column not in filtered:
+            continue
+        if filter_type == "numeric":
+            series = pd.to_numeric(filtered[column], errors="coerce")
+            filtered = filtered[series.between(*value)]
+        elif filter_type == "date":
+            series = pd.to_datetime(filtered[column], errors="coerce").dt.date
+            filtered = filtered[series.between(*value)]
+        elif filter_type == "categorical":
+            filtered = filtered[filtered[column].isin(value)]
+    return filtered.copy(deep=True)
 
 
 def _render_current_mapping(config: SurvivalConfig) -> None:
@@ -1490,17 +1672,36 @@ def _render_survival_summary_metrics(
     summary: dict[str, Any],
     median_survival: float,
     time_unit: str,
+    yearly_probabilities: dict[int, float | None],
+    logrank_result: dict[str, Any] | None,
 ) -> None:
     first_row = st.columns(4)
-    first_row[0].metric("Usable rows", summary["n"])
+    first_row[0].metric("Current cohort", summary["n"])
     first_row[1].metric("Events", summary["events"])
     first_row[2].metric("Censored", summary["censored"])
     first_row[3].metric("Event rate", f"{summary['event_rate']}%")
 
-    second_row = st.columns(3)
-    second_row[0].metric("Median follow-up", _format_time_value(summary["median_followup"], time_unit))
-    second_row[1].metric("Max follow-up", _format_time_value(summary["max_followup"], time_unit))
-    second_row[2].metric("Median survival", format_survival_time(median_survival, time_unit))
+    second_row = st.columns(4)
+    second_row[0].metric("Median survival", format_survival_time(median_survival, time_unit))
+    for column, year in zip(second_row[1:], (1, 3, 5)):
+        probability = yearly_probabilities.get(year)
+        column.metric(
+            f"{year}-year survival",
+            "Not available" if probability is None else f"{probability:.1%}",
+        )
+
+    third_row = st.columns(3 if logrank_result is not None else 2)
+    third_row[0].metric("Median follow-up", _format_time_value(summary["median_followup"], time_unit))
+    third_row[1].metric("Max follow-up", _format_time_value(summary["max_followup"], time_unit))
+    if logrank_result is not None:
+        third_row[2].metric(
+            "Log-rank p-value",
+            (
+                format_p_value(logrank_result["p_value"])
+                if logrank_result.get("available")
+                else "Not available"
+            ),
+        )
 
 
 def _render_survival_group_label_editor(survival_ready_df: pd.DataFrame, group_col: str) -> None:
@@ -1652,6 +1853,9 @@ def _format_number(value: Any) -> str:
 def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
     role_suggestions = suggest_survival_roles(profile)
     all_columns = [str(column) for column in df.columns]
+    pending_config = st.session_state.pop("pending_survival_setup_config", None)
+    if isinstance(pending_config, SurvivalConfig):
+        _seed_survival_setup_widget_state(pending_config, role_suggestions)
 
     time_source_label = st.radio(
         "Survival time setup",
@@ -1787,6 +1991,8 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
         survival_ready_df = create_survival_ready_dataframe(df, config)
         st.session_state["survival_config"] = config
         st.session_state["survival_ready_df"] = survival_ready_df
+        st.session_state.pop("combined_report_html", None)
+        st.session_state.pop("combined_report_pdf", None)
         st.session_state["column_annotations"] = apply_survival_roles(
             sync_annotations(
                 st.session_state.get("column_annotations"),
@@ -1810,6 +2016,58 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
             f"Censored: {censored_count}"
         )
         st.json(_json_safe_config(config))
+
+
+def _seed_survival_setup_widget_state(
+    config: SurvivalConfig,
+    role_suggestions: dict[str, list[dict[str, Any]]],
+) -> None:
+    st.session_state["survival_time_source"] = (
+        "Derive from date columns"
+        if config.time_source == "dates"
+        else "Use a follow-up duration column"
+    )
+
+    def seed_role(prefix: str, value: str | None, candidates: list[dict[str, Any]]) -> None:
+        candidate_columns = [candidate["column_name"] for candidate in candidates]
+        if value is None:
+            st.session_state[f"{prefix}_recommended"] = "__none__"
+        elif value in candidate_columns:
+            st.session_state[f"{prefix}_recommended"] = value
+        else:
+            st.session_state[f"{prefix}_recommended"] = "__search_all__"
+            st.session_state[f"{prefix}_all_columns"] = value
+
+    if config.time_source == "dates":
+        st.session_state["start_date_col_dates"] = config.start_date_col
+        st.session_state["event_date_col_dates"] = config.event_date_col
+        st.session_state["last_followup_date_col_dates"] = config.last_followup_date_col
+        if config.event_date_col:
+            st.session_state[f"missing_event_handling_{config.event_date_col}"] = (
+                "Censored / event did not occur before last follow-up"
+                if config.missing_event_handling == "treat_as_censored"
+                else "Unknown / exclude from survival analysis"
+            )
+    else:
+        seed_role("time_col", config.time_col, role_suggestions["time_candidates"])
+        seed_role("event_col", config.event_col, role_suggestions["event_candidates"])
+        if config.event_col:
+            st.session_state[f"event_values_{config.event_col}"] = config.event_values
+            st.session_state[f"censor_values_{config.event_col}"] = config.censor_values
+            st.session_state[f"unmapped_event_handling_{config.event_col}"] = {
+                "treat_as_censored": "Treat as censored",
+                "treat_as_event": "Treat as events",
+            }.get(config.unmapped_event_handling, "Exclude from survival analysis")
+            st.session_state[f"missing_event_handling_{config.event_col}"] = (
+                "Treat as censored"
+                if config.missing_event_handling == "treat_as_censored"
+                else "Exclude from survival analysis"
+            )
+        if config.time_col:
+            st.session_state[f"time_unit_{config.time_col}"] = config.time_unit
+
+    seed_role("id_col", config.id_col, role_suggestions["id_candidates"])
+    seed_role("group_col", config.group_col, role_suggestions["group_candidates"])
 
 
 def _render_column_annotations(df: pd.DataFrame, profile: pd.DataFrame) -> None:
@@ -1907,6 +2165,121 @@ def _render_column_annotations(df: pd.DataFrame, profile: pd.DataFrame) -> None:
     st.caption("Cox covariate annotations are stored now and will be used when Cox modeling is added.")
 
 
+def _render_export_section(df: pd.DataFrame, profile: pd.DataFrame) -> None:
+    st.subheader("Exports and configuration")
+    uploaded_config = st.file_uploader(
+        "Load mapping and annotation configuration",
+        type=["json"],
+        key="analysis_configuration_upload",
+        help="Configuration is validated against the currently uploaded dataset before use.",
+    )
+    if st.button(
+        "Apply uploaded configuration",
+        disabled=uploaded_config is None,
+    ):
+        try:
+            config, loaded_annotations = deserialize_analysis_configuration(
+                uploaded_config.getvalue()
+            )
+            errors, warnings = validate_survival_config(df, config)
+            if errors:
+                raise ValueError(" ".join(errors))
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["survival_config"] = config
+            st.session_state["survival_ready_df"] = create_survival_ready_dataframe(
+                df,
+                config,
+            )
+            st.session_state["column_annotations"] = sync_annotations(
+                loaded_annotations,
+                df,
+                profile,
+                config,
+            )
+            st.session_state["pending_survival_setup_config"] = config
+            st.session_state["annotation_editor_version"] = (
+                int(st.session_state.get("annotation_editor_version", 0)) + 1
+            )
+            _invalidate_annotation_consumer_state()
+            st.session_state["configuration_status_message"] = (
+                "Mapping and annotations loaded."
+                + (f" Review: {' '.join(warnings)}" if warnings else "")
+            )
+            st.rerun()
+
+    status_message = st.session_state.pop("configuration_status_message", None)
+    if status_message:
+        st.success(status_message)
+
+    config = st.session_state.get("survival_config")
+    annotations = st.session_state.get("column_annotations")
+    if config is None or not isinstance(annotations, dict):
+        st.caption("Confirm or load a survival mapping to enable data and report exports.")
+        return
+
+    ready_df = create_survival_ready_dataframe(df, config)
+    cleaned_df = create_cleaned_mapped_dataframe(df, config)
+    config_bytes = serialize_analysis_configuration(config, annotations)
+
+    data_column, config_column = st.columns(2)
+    data_column.download_button(
+        "Download cleaned mapped data as CSV",
+        data=cleaned_df.to_csv(index=False).encode("utf-8"),
+        file_name="cleaned_mapped_data.csv",
+        mime="text/csv",
+    )
+    config_column.download_button(
+        "Save mapping and annotations as JSON",
+        data=config_bytes,
+        file_name="analysis_configuration.json",
+        mime="application/json",
+    )
+
+    st.markdown("**Combined report**")
+    if st.button("Prepare combined HTML and PDF reports"):
+        quality_report = build_data_quality_report(
+            df,
+            profile,
+            config,
+            ready_df,
+            annotations,
+        )
+        st.session_state["combined_report_html"] = build_html_report(
+            df,
+            config,
+            annotations,
+            quality_report,
+            ready_df,
+        )
+        st.session_state["combined_report_pdf"] = build_pdf_report(
+            df,
+            config,
+            annotations,
+            quality_report,
+            ready_df,
+        )
+
+    html_report = st.session_state.get("combined_report_html")
+    pdf_report = st.session_state.get("combined_report_pdf")
+    if html_report and pdf_report:
+        report_columns = st.columns(2)
+        report_columns[0].download_button(
+            "Download combined report as HTML",
+            data=html_report,
+            file_name="medical_dataset_report.html",
+            mime="text/html",
+        )
+        report_columns[1].download_button(
+            "Download combined report as PDF",
+            data=pdf_report,
+            file_name="medical_dataset_report.pdf",
+            mime="application/pdf",
+        )
+    st.caption("Exports may contain sensitive source data. Store and share them appropriately.")
+
+
 def _invalidate_annotation_consumer_state() -> None:
     for key in [
         "cohort_group_col",
@@ -1916,6 +2289,8 @@ def _invalidate_annotation_consumer_state() -> None:
         "chart_y_col",
         "chart_color_col",
         "survival_analysis_group_col",
+        "combined_report_html",
+        "combined_report_pdf",
     ]:
         st.session_state.pop(key, None)
 

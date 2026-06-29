@@ -196,6 +196,32 @@ def create_binary_event_series(df: pd.DataFrame, config: SurvivalConfig) -> pd.S
 
 def create_survival_ready_dataframe(df: pd.DataFrame, config: SurvivalConfig) -> pd.DataFrame:
     normalized = normalize_missing_values(df)
+    survival_df = _create_survival_columns(normalized, config)
+    columns = [
+        column
+        for column in ["_time", "_event", "_id", "_group"]
+        if column in survival_df
+    ]
+    return survival_df.dropna(subset=["_time", "_event"])[columns].reset_index(drop=True)
+
+
+def create_cleaned_mapped_dataframe(
+    df: pd.DataFrame,
+    config: SurvivalConfig,
+) -> pd.DataFrame:
+    normalized = normalize_missing_values(df)
+    survival_df = _create_survival_columns(normalized, config)
+    result = normalized.copy(deep=True)
+    for column in ["_time", "_event", "_id", "_group"]:
+        if column in survival_df:
+            result[column] = survival_df[column]
+    return result.dropna(subset=["_time", "_event"]).reset_index(drop=True)
+
+
+def _create_survival_columns(
+    normalized: pd.DataFrame,
+    config: SurvivalConfig,
+) -> pd.DataFrame:
     if config.time_source == "dates":
         survival_df = derive_survival_from_dates(normalized, config)
     else:
@@ -212,7 +238,7 @@ def create_survival_ready_dataframe(df: pd.DataFrame, config: SurvivalConfig) ->
     if config.group_col is not None and config.group_col in normalized.columns:
         survival_df["_group"] = normalized[config.group_col]
 
-    return survival_df.dropna(subset=["_time", "_event"]).reset_index(drop=True)
+    return survival_df
 
 
 def derive_survival_from_dates(df: pd.DataFrame, config: SurvivalConfig) -> pd.DataFrame:

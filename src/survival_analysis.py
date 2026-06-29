@@ -7,7 +7,7 @@ from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test, multivariate_logrank_test
 
 
-CURVE_COLUMNS = ["time", "survival", "ci_lower", "ci_upper", "group"]
+CURVE_COLUMNS = ["time", "survival", "ci_lower", "ci_upper", "censored", "group"]
 OVERALL_LABEL = "Overall"
 GROUP_SUMMARY_COLUMNS = [
     "group",
@@ -206,6 +206,25 @@ def survival_probability_at_times(kmf: KaplanMeierFitter, timepoints: list[float
             "survival_probability": [round(float(probability), 4) for probability in probabilities],
         }
     )
+
+
+def survival_probabilities_at_years(
+    kmf: KaplanMeierFitter,
+    time_unit: str,
+) -> dict[int, float | None]:
+    units_per_year = {"days": 365.25, "months": 12.0, "years": 1.0}
+    if time_unit not in units_per_year:
+        return {year: None for year in (1, 3, 5)}
+
+    max_followup = float(kmf.timeline[-1])
+    return {
+        year: (
+            round(float(kmf.predict(year * units_per_year[time_unit])), 4)
+            if year * units_per_year[time_unit] <= max_followup
+            else None
+        )
+        for year in (1, 3, 5)
+    }
 
 
 def format_group_label(
@@ -659,6 +678,7 @@ def _curve_dataframe_from_kmf(kmf: KaplanMeierFitter, label: str) -> pd.DataFram
             "survival": survival_function.iloc[:, 1].astype(float),
             "ci_lower": confidence_interval.iloc[:, 1].astype(float),
             "ci_upper": confidence_interval.iloc[:, 2].astype(float),
+            "censored": kmf.event_table["censored"].astype(int).to_numpy(),
             "group": label,
         }
     )
