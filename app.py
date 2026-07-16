@@ -1,4 +1,5 @@
-from dataclasses import asdict, replace
+from dataclasses import replace
+from html import escape
 from typing import Any
 
 import pandas as pd
@@ -140,7 +141,9 @@ def main() -> None:
     st.title("Medical Dataset Explorer")
 
     upload_tab, data_quality_tab, cohort_tab, charts_tab, survival_tab = st.tabs(
-        ["Upload", "Data Quality", "Cohort Overview", "Charts", "Survival Analysis"]
+        ["Upload", "Data Quality", "Cohort Overview", "Charts", "Survival Analysis"],
+        key="main_tab",
+        on_change="rerun",
     )
 
     with upload_tab:
@@ -1857,6 +1860,7 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
     if isinstance(pending_config, SurvivalConfig):
         _seed_survival_setup_widget_state(pending_config, role_suggestions)
 
+    _render_control_anchor("survival-time-setup")
     time_source_label = st.radio(
         "Survival time setup",
         ["Use a follow-up duration column", "Derive from date columns"],
@@ -1875,12 +1879,14 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
     unmapped_event_handling = "exclude"
 
     if time_source == "duration":
+        _render_control_anchor("follow-up-time")
         time_col = _select_required_role_column(
             "Follow-up / survival time column",
             role_suggestions["time_candidates"],
             all_columns,
             "time_col",
         )
+        _render_control_anchor("event-status")
         event_col = _select_required_role_column(
             "Event/status column",
             role_suggestions["event_candidates"],
@@ -1888,6 +1894,7 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
             "event_col",
         )
         if event_col:
+            _render_control_anchor("event-values")
             (
                 event_values,
                 censor_values,
@@ -1907,18 +1914,21 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
         date_options = date_columns + [
             column for column in all_columns if column not in date_columns
         ]
+        _render_control_anchor("start-date")
         start_date_col = st.selectbox(
             "Start date column",
             date_options,
             index=_suggest_date_column_index(date_options, ("start", "diagnosis", "enroll", "index")),
             key="start_date_col_dates",
         )
+        _render_control_anchor("event-date")
         event_date_col = st.selectbox(
             "Event date column",
             date_options,
             index=_suggest_date_column_index(date_options, ("event", "death", "relapse", "progress")),
             key="event_date_col_dates",
         )
+        _render_control_anchor("last-follow-up-date")
         last_followup_date_col = st.selectbox(
             "Last follow-up date column",
             date_options,
@@ -1946,6 +1956,7 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
         time_unit = "days"
         st.caption("Time unit: days")
 
+    _render_control_anchor("patient-id")
     id_col = _select_optional_role_column(
         "Patient ID column",
         role_suggestions["id_candidates"],
@@ -1954,6 +1965,7 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
         "id_col",
     )
 
+    _render_control_anchor("group-column")
     group_col = _select_optional_role_column(
         "Optional grouping column",
         role_suggestions["group_candidates"],
@@ -1962,32 +1974,29 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
         "group_col",
     )
 
-    if st.button("Confirm survival mapping", type="primary"):
-        config = SurvivalConfig(
-            time_col=time_col,
-            event_col=event_col,
-            event_values=event_values,
-            censor_values=censor_values,
-            id_col=id_col,
-            group_col=group_col,
-            time_unit=time_unit,
-            missing_event_handling=missing_event_handling,
-            unmapped_event_handling=unmapped_event_handling,
-            time_source=time_source,
-            start_date_col=start_date_col,
-            event_date_col=event_date_col,
-            last_followup_date_col=last_followup_date_col,
-        )
-        errors, warnings = validate_survival_config(df, config)
+    config = SurvivalConfig(
+        time_col=time_col,
+        event_col=event_col,
+        event_values=event_values,
+        censor_values=censor_values,
+        id_col=id_col,
+        group_col=group_col,
+        time_unit=time_unit,
+        missing_event_handling=missing_event_handling,
+        unmapped_event_handling=unmapped_event_handling,
+        time_source=time_source,
+        start_date_col=start_date_col,
+        event_date_col=event_date_col,
+        last_followup_date_col=last_followup_date_col,
+    )
+    errors, warnings = validate_survival_config(df, config)
+    mapping_is_current = st.session_state.get("survival_config") == config
 
-        for warning in warnings:
-            st.warning(warning)
-
-        if errors:
-            for error in errors:
-                st.error(error)
-            return
-
+    if st.button(
+        "Confirm survival mapping",
+        type="primary",
+        disabled=bool(errors) or mapping_is_current,
+    ):
         survival_ready_df = create_survival_ready_dataframe(df, config)
         st.session_state["survival_config"] = config
         st.session_state["survival_ready_df"] = survival_ready_df
@@ -2015,7 +2024,149 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
             f"Events: {event_count}\n\n"
             f"Censored: {censored_count}"
         )
-        st.json(_json_safe_config(config))
+
+    mapping_is_current = st.session_state.get("survival_config") == config
+    _render_mapping_validation_summary(
+        df,
+        config,
+        errors,
+        warnings,
+        mapping_is_current=mapping_is_current,
+    )
+    if not errors and mapping_is_current:
+        st.button(
+            "Continue to Data Quality",
+            type="primary",
+            on_click=_navigate_to_main_tab,
+            args=("Data Quality",),
+        )
+
+
+def _navigate_to_main_tab(tab_label: str) -> None:
+    st.session_state["main_tab"] = tab_label
+
+
+def _render_control_anchor(anchor: str) -> None:
+    st.markdown(f"<span id='{anchor}'></span>", unsafe_allow_html=True)
+
+
+def _render_mapping_validation_summary(
+    df: pd.DataFrame,
+    config: SurvivalConfig,
+    errors: list[str],
+    warnings: list[str],
+    *,
+    mapping_is_current: bool,
+) -> None:
+    _render_control_anchor("validation-summary")
+    st.markdown("#### Validation summary")
+    if errors:
+        st.error(
+            f"{len(errors)} blocking issue{'s' if len(errors) != 1 else ''}. "
+            "Fix these before confirming the mapping."
+        )
+        st.markdown("**Errors**")
+        for message in errors:
+            _render_validation_issue(message)
+    else:
+        st.success(
+            "Mapping is valid and confirmed."
+            if mapping_is_current
+            else "Mapping is valid and ready to confirm."
+        )
+
+    if warnings:
+        st.markdown("**Warnings**")
+        for message in warnings:
+            _render_validation_issue(message)
+
+    status, patient_message = _assess_patient_level_structure(df, config.id_col)
+    st.markdown("**Dataset suitability**")
+    getattr(st, status)(patient_message)
+    if errors:
+        st.warning(
+            "This dataset is not currently suitable for survival analysis. "
+            "Cohort and chart exploration remain available while the blocking issues are fixed."
+        )
+    st.caption(
+        "Best fit: one row per patient, subject, admission, or case with individual follow-up "
+        "and event status. Aggregate trial summaries and repeated-visit tables need reshaping "
+        "before basic survival analysis."
+    )
+
+
+def _render_validation_issue(message: str) -> None:
+    anchor = _validation_fix_anchor(message)
+    st.markdown(
+        f"- {escape(message)} <a href='#{anchor}'>Fix</a>",
+        unsafe_allow_html=True,
+    )
+
+
+def _validation_fix_anchor(message: str) -> str:
+    normalized = message.lower()
+    if "patient id" in normalized:
+        return "patient-id"
+    if "group column" in normalized:
+        return "group-column"
+    if "start date" in normalized:
+        return "start-date"
+    if "last follow-up date" in normalized:
+        return "last-follow-up-date"
+    if "event date" in normalized:
+        return "event-date"
+    if (
+        "event value" in normalized
+        or "unmapped values" in normalized
+        or "event count" in normalized
+        or "censor" in normalized
+        or "usable rows" in normalized
+    ):
+        return "event-values"
+    if "event column" in normalized:
+        return "event-status"
+    if "time source" in normalized:
+        return "survival-time-setup"
+    return "follow-up-time"
+
+
+def _assess_patient_level_structure(
+    df: pd.DataFrame,
+    id_col: str | None,
+) -> tuple[str, str]:
+    if id_col is None or id_col not in df.columns:
+        return (
+            "info",
+            "Patient-level structure is unverified. Select a patient ID to check the "
+            "one-row-per-patient assumption; until then, counts treat each row as a case.",
+        )
+
+    ids = normalize_missing_values(df[[id_col]])[id_col]
+    non_missing_ids = ids.dropna()
+    missing_count = int(ids.isna().sum())
+    repeated_ids = non_missing_ids[non_missing_ids.duplicated(keep=False)]
+    if not repeated_ids.empty:
+        repeated_count = int(repeated_ids.nunique())
+        return (
+            "warning",
+            "Poor fit for basic patient-level analysis: "
+            f"{repeated_count} {id_col} value{'s' if repeated_count != 1 else ''} "
+            "repeat across "
+            f"{len(repeated_ids)} rows. This looks like repeated visits or records; "
+            "reduce to one analysis row per patient or use a repeated-measures method.",
+        )
+    if missing_count:
+        return (
+            "warning",
+            f"Patient-level structure is uncertain: {id_col} is missing in "
+            f"{missing_count} row{'s' if missing_count != 1 else ''}, which cannot "
+            "be checked for uniqueness.",
+        )
+    return (
+        "success",
+        f"Patient-level structure check passed: {id_col} is unique across "
+        f"{len(non_missing_ids)} non-missing rows.",
+    )
 
 
 def _seed_survival_setup_widget_state(
@@ -2644,23 +2795,6 @@ def _format_event_handling(value: str) -> str:
         "treat_as_censored": "Treat as censored",
         "treat_as_event": "Treat as events",
     }.get(value, str(value))
-
-
-def _json_safe_config(config: SurvivalConfig) -> dict[str, Any]:
-    config_dict = asdict(config)
-    config_dict["event_values"] = [_json_safe_value(value) for value in config.event_values]
-    config_dict["censor_values"] = [_json_safe_value(value) for value in config.censor_values]
-    return config_dict
-
-
-def _json_safe_value(value: Any) -> Any:
-    if pd.isna(value):
-        return None
-
-    if hasattr(value, "item"):
-        return value.item()
-
-    return value
 
 
 if __name__ == "__main__":
