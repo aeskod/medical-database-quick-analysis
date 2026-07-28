@@ -50,9 +50,8 @@ def test_reupload_changed_content_with_same_name_resets_full_app_state():
     assert "survival_config" not in app_test.session_state
     assert "survival_ready_df" not in app_test.session_state
     assert "survival_timepoints" not in app_test.session_state
-    assert app_test.session_state["chart_x_col"] == "time"
-    assert "event_values_status" in app_test.session_state
-    assert app_test.session_state["event_values_status"] == [1]
+    assert "chart_x_col" not in app_test.session_state
+    assert "event_values_status" not in app_test.session_state
     assert app_test.session_state["uploaded_dataset_signature"] == (
         f"sha256:{hashlib.sha256(CHANGED_CSV).hexdigest()};parser-extension:.csv"
     )
@@ -68,8 +67,8 @@ def test_reupload_changed_content_with_same_name_resets_full_app_state():
         for message in app_test.info
     )
     assert any(
-        "No survival mapping has been confirmed yet" in message.value
-        for message in app_test.info
+        "Survival mapping is optional" in message.value
+        for message in app_test.caption
     )
 
 

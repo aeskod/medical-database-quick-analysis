@@ -94,6 +94,7 @@ def test_survival_controls_update_counts_and_expose_requested_cards():
     app_test.session_state["survival_config"] = config
     app_test.session_state["survival_ready_df"] = create_survival_ready_dataframe(df, config)
     app_test.session_state["column_annotations"] = _annotations(df)
+    app_test.session_state["main_tab"] = "Survival Analysis"
 
     app_test.run(timeout=30)
 
@@ -123,6 +124,10 @@ def test_survival_controls_update_counts_and_expose_requested_cards():
     )
     assert image_format.options == ["PNG", "SVG"]
 
+    filter_variables = next(
+        item for item in app_test.multiselect if item.label == "Add filter variables"
+    )
+    app_test = filter_variables.set_value(["treatment"]).run(timeout=30)
     treatment_filter = next(
         item for item in app_test.multiselect if item.label == "Filter by treatment"
     )

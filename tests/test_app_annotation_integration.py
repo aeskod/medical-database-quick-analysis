@@ -65,7 +65,7 @@ def test_annotation_component_renders_editor_actions_and_use_summary():
         "Reset to suggested annotations",
     }
     metrics = {metric.label: metric.value for metric in app_test.metric}
-    assert list(metrics) == ["Filters", "Groups", "Baseline", "Cox", "Charts", "Ignored"]
+    assert list(metrics) == ["Filters", "Groups", "Baseline", "Charts", "Ignored"]
     assert metrics["Ignored"] == "1"
 
 
@@ -100,17 +100,12 @@ def test_all_analysis_tabs_consume_the_same_saved_annotations():
     app_test.session_state["survival_config"] = config
     app_test.session_state["survival_ready_df"] = create_survival_ready_dataframe(df, config)
     app_test.session_state["column_annotations"] = annotations
+    app_test.session_state["main_tab"] = "Cohort Overview"
 
     app_test.run(timeout=30)
 
     assert not app_test.exception
     group_by = next(item for item in app_test.selectbox if item.label == "Group by")
-    survival_group = next(
-        item
-        for item in app_test.selectbox
-        if item.label == "Group / stratification variable"
-    )
-    chart_x = next(item for item in app_test.selectbox if item.label == "X variable")
     continuous = next(
         item
         for item in app_test.multiselect
@@ -123,7 +118,19 @@ def test_all_analysis_tabs_consume_the_same_saved_annotations():
     )
 
     assert group_by.options == ["No grouping", "sex", "treatment"]
-    assert survival_group.options == ["No grouping", "sex", "treatment"]
-    assert chart_x.options == ["None", "time", "status", "age", "sex"]
     assert continuous.value == ["age"]
     assert categorical.value == ["sex"]
+
+    navigation = next(item for item in app_test.radio if item.label == "Go to")
+    app_test = navigation.set_value("Charts").run(timeout=30)
+    chart_x = next(item for item in app_test.selectbox if item.label == "X variable")
+    assert chart_x.options == ["None", "time", "status", "age", "sex"]
+
+    navigation = next(item for item in app_test.radio if item.label == "Go to")
+    app_test = navigation.set_value("Survival Analysis").run(timeout=30)
+    survival_group = next(
+        item
+        for item in app_test.selectbox
+        if item.label == "Group / stratification variable"
+    )
+    assert survival_group.options == ["No grouping", "sex", "treatment"]

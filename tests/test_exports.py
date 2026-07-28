@@ -143,6 +143,7 @@ def test_export_component_prepares_all_downloads_on_demand():
 
     assert not app_test.exception
     assert {button.label for button in app_test.get("download_button")} == {
+        "Download current dataset as CSV",
         "Download cleaned mapped data as CSV",
         "Save mapping and annotations as JSON",
     }
@@ -172,7 +173,7 @@ def test_export_component_loads_configuration_into_current_dataset():
     uploader = next(
         item
         for item in app_test.file_uploader
-        if item.label == "Load mapping and annotation configuration"
+        if item.label == "Configuration JSON"
     )
     app_test = uploader.upload(
         "analysis_configuration.json",

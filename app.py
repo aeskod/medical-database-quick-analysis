@@ -1,5 +1,7 @@
 from dataclasses import replace
 from html import escape
+from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -114,6 +116,9 @@ DATASET_DERIVED_SESSION_KEYS = {
     "combined_report_pdf",
     "show_more_preview_rows",
     "survival_time_source",
+    "active_survival_filter_columns",
+    "active_survival_filters",
+    "loaded_example_dataset",
 }
 
 DATASET_DERIVED_SESSION_PREFIXES = (
@@ -135,71 +140,269 @@ DATASET_DERIVED_SESSION_PREFIXES = (
 )
 
 
+PAGE_OPTIONS = [
+    "Dataset",
+    "Setup",
+    "Data Quality",
+    "Cohort Overview",
+    "Charts",
+    "Survival Analysis",
+    "Export",
+]
+ANALYSIS_GOAL_EXPLORE = "Explore and review the dataset"
+ANALYSIS_GOAL_SURVIVAL = "Run survival analysis"
+EXAMPLE_DATASETS = {
+    "Lung cancer cohort (recommended)": "lung.csv",
+    "Rossi recidivism cohort": "rossi.csv",
+}
+
+
 def main() -> None:
     st.set_page_config(page_title="Medical Dataset Explorer", layout="wide")
 
     st.title("Medical Dataset Explorer")
+    st.caption(
+        "Review patient-level datasets, check data quality, and run exploratory "
+        "survival analysis when follow-up data are available."
+    )
+    page = _render_sidebar_navigation()
 
-    upload_tab, data_quality_tab, cohort_tab, charts_tab, survival_tab = st.tabs(
-        ["Upload", "Data Quality", "Cohort Overview", "Charts", "Survival Analysis"],
+    if page == "Dataset":
+        _render_dataset_page()
+    elif page == "Setup":
+        _render_setup_page()
+    elif page == "Data Quality":
+        _render_data_quality_tab()
+    elif page == "Cohort Overview":
+        _render_cohort_overview_tab()
+    elif page == "Charts":
+        _render_charts_tab()
+    elif page == "Survival Analysis":
+        _render_survival_analysis_tab()
+    elif page == "Export":
+        _render_export_page()
+
+
+def _render_sidebar_navigation() -> str:
+    if st.session_state.get("main_tab") not in PAGE_OPTIONS:
+        st.session_state["main_tab"] = "Dataset"
+
+    st.sidebar.markdown("### Workspace")
+    uploaded_df = st.session_state.get("uploaded_df")
+    metadata = st.session_state.get("dataset_metadata")
+    if uploaded_df is None:
+        st.sidebar.caption("No dataset loaded")
+        st.sidebar.markdown("○ Dataset\n\n○ Survival mapping\n\n○ Data quality")
+    else:
+        file_name = getattr(metadata, "file_name", "Current dataset")
+        st.sidebar.markdown(f"**{escape(str(file_name))}**")
+        st.sidebar.caption(f"{len(uploaded_df):,} rows · {len(uploaded_df.columns):,} columns")
+        if st.session_state.get("survival_config"):
+            mapping_status = "✓ Confirmed"
+        elif st.session_state.get("analysis_goal") == ANALYSIS_GOAL_SURVIVAL:
+            mapping_status = "○ Not configured"
+        else:
+            mapping_status = "○ Optional"
+        quality_report = st.session_state.get("data_quality_report")
+        if quality_report is None:
+            quality_status = "○ Not reviewed"
+        else:
+            status = determine_quality_status(quality_report.get("issues", []))
+            quality_status = {
+                "error": "! Blocking issues",
+                "warning": "! Review warnings",
+                "success": "✓ Reviewed",
+            }.get(status, "✓ Reviewed")
+        active_filters = st.session_state.get("active_survival_filters", {})
+        st.sidebar.markdown(
+            "✓ Dataset loaded  \n"
+            f"{mapping_status} survival mapping  \n"
+            f"{quality_status} data quality  \n"
+            f"{len(active_filters)} active filter{'s' if len(active_filters) != 1 else ''}"
+        )
+
+    st.sidebar.markdown("---")
+    return st.sidebar.radio(
+        "Go to",
+        PAGE_OPTIONS,
         key="main_tab",
-        on_change="rerun",
+        label_visibility="collapsed",
     )
 
-    with upload_tab:
-        uploaded_file = st.file_uploader(
-            "Upload a dataset",
-            type=["csv", "tsv", "txt", "xlsx"],
-            help="Supported formats: CSV, TSV, TXT, XLSX",
+
+def _render_dataset_page() -> None:
+    st.header("Dataset")
+    st.write("Start by uploading a patient-level table, or load a bundled example.")
+
+    uploaded_file = st.file_uploader(
+        "Upload a dataset",
+        type=["csv", "tsv", "txt", "xlsx"],
+        help="Supported formats: CSV, TSV, TXT, XLSX",
+    )
+    st.caption("Supported formats: CSV, TSV, TXT, XLSX")
+
+    with st.expander("Try an example dataset"):
+        example_label = st.selectbox("Example dataset", list(EXAMPLE_DATASETS))
+        st.caption(
+            "The lung cohort is the clearest first walkthrough: time and event columns "
+            "are detected automatically."
         )
-        st.caption("Supported formats: CSV, TSV, TXT, XLSX")
+        if st.button("Load example dataset"):
+            _load_example_dataset(EXAMPLE_DATASETS[example_label])
+            st.rerun()
 
-        if uploaded_file is None:
-            st.info("Upload a CSV, TSV, TXT, or Excel file to begin.")
+    if uploaded_file is not None:
+        try:
+            content_digest = uploaded_file_content_digest(uploaded_file)
+            load_result = read_dataset_with_metadata(uploaded_file)
+        except ValueError as exc:
+            st.error(str(exc))
         else:
-            try:
-                content_digest = uploaded_file_content_digest(uploaded_file)
-                load_result = read_dataset_with_metadata(uploaded_file)
-            except ValueError as exc:
-                st.error(str(exc))
-            else:
-                df = load_result.dataframe
-                dataset_replaced = _sync_uploaded_dataset_state(
-                    uploaded_file.name,
-                    df,
-                    content_digest=content_digest,
+            dataset_replaced = _sync_uploaded_dataset_state(
+                uploaded_file.name,
+                load_result.dataframe,
+                content_digest=content_digest,
+            )
+            st.session_state["dataset_metadata"] = load_result.metadata
+            if dataset_replaced:
+                st.info(
+                    "A different dataset was detected. Previous survival mapping, "
+                    "annotations, and analysis selections were reset."
                 )
-                if dataset_replaced:
-                    st.info(
-                        "A different dataset was detected. Previous survival mapping, "
-                        "annotations, and analysis selections were reset."
-                    )
-                st.success("Dataset loaded successfully.")
-                _render_dataset_summary(load_result.metadata, df)
+            st.success("Dataset loaded successfully.")
 
-                st.subheader("Preview")
-                profile = st.session_state["profile_df"]
-                _render_dataset_preview(df, profile)
+    df = st.session_state.get("uploaded_df")
+    profile = st.session_state.get("profile_df")
+    metadata = st.session_state.get("dataset_metadata")
+    if df is None or profile is None or metadata is None:
+        st.info("Upload a CSV, TSV, TXT, or Excel file to begin.")
+        return
 
-                st.subheader("Column profile")
-                st.dataframe(profile, width="stretch")
+    _render_dataset_summary(metadata, df)
+    goal_options = [ANALYSIS_GOAL_EXPLORE, ANALYSIS_GOAL_SURVIVAL]
+    saved_goal = st.session_state.get("analysis_goal", ANALYSIS_GOAL_EXPLORE)
+    if st.session_state.get("analysis_goal_selector") not in goal_options:
+        st.session_state["analysis_goal_selector"] = saved_goal
+    analysis_goal = st.radio(
+        "What would you like to do?",
+        goal_options,
+        horizontal=True,
+        key="analysis_goal_selector",
+        on_change=_sync_analysis_goal,
+    )
+    st.session_state["analysis_goal"] = analysis_goal
+    if analysis_goal == ANALYSIS_GOAL_SURVIVAL:
+        st.caption("Next, confirm the follow-up time and event meaning on Setup.")
+    else:
+        st.caption("Survival mapping is optional. You can go directly to data quality and charts.")
 
-                st.subheader("Survival setup")
-                _render_survival_setup(df, profile)
-                _render_column_annotations(df, profile)
-                _render_export_section(df, profile)
+    st.subheader("Preview")
+    _render_dataset_preview(df, profile)
 
-    with data_quality_tab:
-        _render_data_quality_tab()
+    with st.expander("Column profile and type detection"):
+        st.caption(
+            "Technical profiling details are useful when a column type or recommendation "
+            "looks incorrect."
+        )
+        st.dataframe(profile, width="stretch")
 
-    with cohort_tab:
-        _render_cohort_overview_tab()
+    next_page = "Setup" if analysis_goal == ANALYSIS_GOAL_SURVIVAL else "Data Quality"
+    next_label = (
+        "Continue to Survival Setup"
+        if analysis_goal == ANALYSIS_GOAL_SURVIVAL
+        else "Continue to Data Quality"
+    )
+    st.button(
+        next_label,
+        type="primary",
+        on_click=_navigate_to_main_tab,
+        args=(next_page,),
+    )
 
-    with charts_tab:
-        _render_charts_tab()
 
-    with survival_tab:
-        _render_survival_analysis_tab()
+def _load_example_dataset(file_name: str) -> None:
+    example_path = Path(__file__).resolve().parent / "datasets" / file_name
+    content = example_path.read_bytes()
+    uploaded = BytesIO(content)
+    uploaded.name = file_name
+    load_result = read_dataset_with_metadata(uploaded)
+    _sync_uploaded_dataset_state(
+        file_name,
+        load_result.dataframe,
+        content_digest=uploaded_file_content_digest(uploaded),
+    )
+    st.session_state["dataset_metadata"] = load_result.metadata
+    st.session_state["analysis_goal"] = ANALYSIS_GOAL_SURVIVAL
+    st.session_state["analysis_goal_selector"] = ANALYSIS_GOAL_SURVIVAL
+    st.session_state["loaded_example_dataset"] = file_name
+    if file_name == "lung.csv":
+        st.session_state["time_unit_time"] = "days"
+
+
+def _sync_analysis_goal() -> None:
+    selected = st.session_state.get("analysis_goal_selector")
+    if selected in {ANALYSIS_GOAL_EXPLORE, ANALYSIS_GOAL_SURVIVAL}:
+        st.session_state["analysis_goal"] = selected
+
+
+def _render_setup_page() -> None:
+    st.header("Setup")
+    st.caption("Confirm only the information needed for your analysis. Advanced column settings are optional.")
+    df = st.session_state.get("uploaded_df")
+    profile = st.session_state.get("profile_df")
+    if df is None or profile is None:
+        st.info("Load a dataset before configuring analysis roles.")
+        st.button(
+            "Go to Dataset",
+            type="primary",
+            on_click=_navigate_to_main_tab,
+            args=("Dataset",),
+        )
+        return
+
+    goal = st.session_state.get("analysis_goal", ANALYSIS_GOAL_EXPLORE)
+    if goal == ANALYSIS_GOAL_SURVIVAL or st.session_state.get("survival_config") is not None:
+        st.subheader("Survival mapping")
+        st.write(
+            "Confirm how follow-up time and event status are represented. "
+            "Recommended columns are preselected, but their clinical meaning must be verified."
+        )
+        _render_survival_setup(df, profile)
+    else:
+        st.info(
+            "Survival setup is skipped for the current goal. Data Quality, Cohort Overview, "
+            "and Charts are ready to use."
+        )
+        action_columns = st.columns(2)
+        action_columns[0].button(
+            "Continue to Data Quality",
+            type="primary",
+            on_click=_navigate_to_main_tab,
+            args=("Data Quality",),
+        )
+        if action_columns[1].button("Enable survival analysis"):
+            st.session_state["analysis_goal"] = ANALYSIS_GOAL_SURVIVAL
+            st.rerun()
+
+    with st.expander("Advanced: column meanings and analysis uses"):
+        _render_column_annotations(df, profile)
+
+
+def _render_export_page() -> None:
+    st.header("Export")
+    st.caption("Download the current dataset, reusable configuration, or a combined report.")
+    df = st.session_state.get("uploaded_df")
+    profile = st.session_state.get("profile_df")
+    if df is None or profile is None:
+        st.info("Load a dataset before exporting results.")
+        st.button(
+            "Go to Dataset",
+            type="primary",
+            on_click=_navigate_to_main_tab,
+            args=("Dataset",),
+        )
+        return
+    _render_export_section(df, profile)
 
 
 def _render_dataset_summary(metadata: DatasetMetadata, df: pd.DataFrame) -> None:
@@ -328,7 +531,8 @@ def _invalidate_dataset_derived_state() -> None:
 
 
 def _render_data_quality_tab() -> None:
-    st.subheader("Data Quality")
+    st.header("Data Quality")
+    st.caption("Start with the issues that can change interpretation; open detailed diagnostics only when needed.")
 
     uploaded_df = st.session_state.get("uploaded_df")
     profile_df = st.session_state.get("profile_df")
@@ -349,12 +553,13 @@ def _render_data_quality_tab() -> None:
     _render_quality_status(report["issues"])
     _render_quality_summary_cards(report)
     _render_quality_issues(report["issues"])
-    _render_missingness_section(report, uploaded_df)
-    _render_duplicate_checks(report)
-    _render_clinical_value_checks(report)
-    _render_survival_quality_section(report)
-    _render_group_quality_section(report)
-    _render_sensitive_columns_section(report)
+    with st.expander("Detailed diagnostics"):
+        _render_missingness_section(report, uploaded_df)
+        _render_duplicate_checks(report)
+        _render_clinical_value_checks(report)
+        _render_survival_quality_section(report)
+        _render_group_quality_section(report)
+        _render_sensitive_columns_section(report)
 
 
 def _render_quality_status(issues: list[Any]) -> None:
@@ -576,7 +781,8 @@ def _render_sensitive_columns_section(report: dict[str, Any]) -> None:
 
 
 def _render_cohort_overview_tab() -> None:
-    st.subheader("Cohort Overview")
+    st.header("Cohort Overview")
+    st.caption("Understand who is in the current cohort before building a detailed baseline table.")
 
     uploaded_df = st.session_state.get("uploaded_df")
     profile_df = st.session_state.get("profile_df")
@@ -620,69 +826,70 @@ def _render_cohort_overview_tab() -> None:
     )
     _render_cohort_mapping_summary(survival_config)
 
-    st.subheader("Variable type summary")
-    st.dataframe(variable_type_summary, hide_index=True, width="stretch")
+    with st.expander("Advanced: variable type summary"):
+        st.dataframe(variable_type_summary, hide_index=True, width="stretch")
 
-    st.subheader("Variables to include")
-    group_col = _render_cohort_group_selector(
-        uploaded_df,
-        annotations,
-        survival_config,
-    )
-    continuous_vars, categorical_vars, max_levels, include_missing = _render_baseline_table_controls(
-        default_variables,
-    )
-
-    overlapping_vars = sorted(set(continuous_vars) & set(categorical_vars))
-    if overlapping_vars:
-        st.warning(
-            "Variables selected as both continuous and categorical will be summarized as categorical: "
-            + ", ".join(overlapping_vars)
-        )
-        continuous_vars = [column for column in continuous_vars if column not in overlapping_vars]
-
-    if group_col is not None and (
-        group_col in continuous_vars or group_col in categorical_vars
-    ):
-        st.caption(
-            f"`{group_col}` defines the Table 1 columns and is not repeated as a characteristic."
-        )
-        continuous_vars = [column for column in continuous_vars if column != group_col]
-        categorical_vars = [column for column in categorical_vars if column != group_col]
-
-    st.subheader("Baseline characteristics")
-    if not continuous_vars and not categorical_vars:
-        st.info("No characteristics selected; Table 1 still includes cohort and survival rows.")
-
-    grouped_survival_df = (
-        _survival_dataframe_for_group(
+    with st.expander("Build a baseline characteristics table"):
+        st.markdown("**Variables to include**")
+        group_col = _render_cohort_group_selector(
             uploaded_df,
+            annotations,
             survival_config,
-            survival_ready_df,
-            group_col,
         )
-        if survival_config is not None and survival_ready_df is not None
-        else survival_ready_df
-    )
+        continuous_vars, categorical_vars, max_levels, include_missing = _render_baseline_table_controls(
+            default_variables,
+        )
 
-    baseline_table = build_baseline_table(
-        uploaded_df,
-        continuous_vars,
-        categorical_vars,
-        group_col=group_col,
-        max_levels=max_levels,
-        include_missing=include_missing,
-        group_value_labels=_group_value_labels_for_column(group_col),
-        survival_ready_df=grouped_survival_df,
-        id_col=id_col,
-    )
-    st.dataframe(baseline_table, hide_index=True, width="stretch")
-    st.download_button(
-        "Download baseline table as CSV",
-        data=baseline_table.to_csv(index=False).encode("utf-8"),
-        file_name="baseline_characteristics.csv",
-        mime="text/csv",
-    )
+        overlapping_vars = sorted(set(continuous_vars) & set(categorical_vars))
+        if overlapping_vars:
+            st.warning(
+                "Variables selected as both continuous and categorical will be summarized as categorical: "
+                + ", ".join(overlapping_vars)
+            )
+            continuous_vars = [column for column in continuous_vars if column not in overlapping_vars]
+
+        if group_col is not None and (
+            group_col in continuous_vars or group_col in categorical_vars
+        ):
+            st.caption(
+                f"`{group_col}` defines the Table 1 columns and is not repeated as a characteristic."
+            )
+            continuous_vars = [column for column in continuous_vars if column != group_col]
+            categorical_vars = [column for column in categorical_vars if column != group_col]
+
+        st.markdown("**Baseline characteristics**")
+        if not continuous_vars and not categorical_vars:
+            st.info("No characteristics selected; Table 1 still includes cohort and survival rows.")
+
+        grouped_survival_df = (
+            _survival_dataframe_for_group(
+                uploaded_df,
+                survival_config,
+                survival_ready_df,
+                group_col,
+            )
+            if survival_config is not None and survival_ready_df is not None
+            else survival_ready_df
+        )
+
+        baseline_table = build_baseline_table(
+            uploaded_df,
+            continuous_vars,
+            categorical_vars,
+            group_col=group_col,
+            max_levels=max_levels,
+            include_missing=include_missing,
+            group_value_labels=_group_value_labels_for_column(group_col),
+            survival_ready_df=grouped_survival_df,
+            id_col=id_col,
+        )
+        st.dataframe(baseline_table, hide_index=True, width="stretch")
+        st.download_button(
+            "Download baseline table as CSV",
+            data=baseline_table.to_csv(index=False).encode("utf-8"),
+            file_name="baseline_characteristics.csv",
+            mime="text/csv",
+        )
 
 
 def _render_cohort_summary_cards(metrics: dict[str, Any]) -> None:
@@ -800,7 +1007,7 @@ def _render_key_cohort_characteristics(
     if not rendered:
         st.info(
             "No age, sex/gender, diagnosis, treatment, or outcome columns are annotated. "
-            "Update Column annotations on Upload to add these summaries."
+            "Update Column annotations in Setup to add these summaries."
         )
 
 
@@ -892,7 +1099,7 @@ def _render_cohort_group_selector(
         key="cohort_group_col",
     )
     if not group_columns:
-        st.caption("No columns are annotated for grouping. Update Column annotations on Upload.")
+        st.caption("No columns are annotated for grouping. Update Column annotations in Setup.")
     return None if selected == "No grouping" else str(selected)
 
 
@@ -934,7 +1141,7 @@ def _render_baseline_table_controls(
     if not all_columns:
         st.caption(
             "No columns are annotated for the baseline table. "
-            "Update Column annotations on Upload."
+            "Update Column annotations in Setup."
         )
 
     control_row = st.columns(2)
@@ -1006,7 +1213,8 @@ def _metric_value(value: Any) -> Any:
 
 
 def _render_charts_tab() -> None:
-    st.subheader("Charts")
+    st.header("Charts")
+    st.caption("Choose variables first. Auto mode recommends a compatible chart from their detected types.")
 
     uploaded_df = st.session_state.get("uploaded_df")
     profile_df = st.session_state.get("profile_df")
@@ -1024,7 +1232,7 @@ def _render_charts_tab() -> None:
     if not all_columns:
         st.warning(
             "No columns are annotated for charts. "
-            "Update Column annotations on Upload."
+            "Update Column annotations in Setup."
         )
         return
 
@@ -1102,27 +1310,28 @@ def _render_charts_tab() -> None:
     if axis_controls_disabled:
         st.caption(f"{chart_type_label} uses the full dataset, so X, Y, and color variables are disabled.")
 
-    option_row = st.columns(3)
-    max_category_levels = int(
-        option_row[0].slider(
-            "Maximum categorical levels",
-            min_value=3,
-            max_value=50,
-            value=20,
+    with st.expander("Advanced chart options"):
+        option_row = st.columns(3)
+        max_category_levels = int(
+            option_row[0].slider(
+                "Maximum categorical levels",
+                min_value=3,
+                max_value=50,
+                value=20,
+            )
         )
-    )
-    include_missing = bool(
-        option_row[1].checkbox(
-            "Include missing values in categorical charts",
-            value=True,
+        include_missing = bool(
+            option_row[1].checkbox(
+                "Include missing values in categorical charts",
+                value=True,
+            )
         )
-    )
-    normalize = bool(
-        option_row[2].checkbox(
-            "Normalize stacked bar chart to percentages",
-            value=False,
+        normalize = bool(
+            option_row[2].checkbox(
+                "Normalize stacked bar chart to percentages",
+                value=False,
+            )
         )
-    )
 
     x_col = None if axis_controls_disabled else _none_option_to_value(x_choice)
     y_col = None if axis_controls_disabled else _none_option_to_value(y_choice)
@@ -1276,7 +1485,8 @@ def _render_chart_survival_mapping_note(
 
 
 def _render_survival_analysis_tab() -> None:
-    st.subheader("Survival Analysis")
+    st.header("Survival Analysis")
+    st.caption("Review the current cohort, then interpret the Kaplan–Meier curve and group comparison.")
 
     config = st.session_state.get("survival_config")
     survival_ready_df = st.session_state.get("survival_ready_df")
@@ -1287,11 +1497,18 @@ def _render_survival_analysis_tab() -> None:
     if config is None or survival_ready_df is None:
         st.info(
             "No survival mapping has been confirmed yet.\n\n"
-            "Go to the Upload tab and confirm the required survival columns first."
+            "Go to Setup and confirm the required survival columns first."
+        )
+        st.button(
+            "Go to Setup",
+            type="primary",
+            on_click=_navigate_to_main_tab,
+            args=("Setup",),
         )
         return
 
-    _render_current_mapping(config)
+    with st.expander("Current survival mapping"):
+        _render_current_mapping(config)
 
     errors, validation_warnings = validate_survival_ready_dataframe(survival_ready_df)
     if errors:
@@ -1341,7 +1558,7 @@ def _render_survival_analysis_tab() -> None:
     has_group = analysis_group_col is not None and "_group" in survival_ready_df.columns
     use_group = has_group
     if not group_columns:
-        st.caption("No columns are annotated for grouping. Update Column annotations on Upload.")
+        st.caption("No columns are annotated for grouping. Update Column annotations in Setup.")
 
     summary = get_survival_summary(survival_ready_df, config.time_unit)
     overall_result = fit_km_overall(survival_ready_df)
@@ -1388,19 +1605,6 @@ def _render_survival_analysis_tab() -> None:
         logrank_result,
     )
 
-    overall_summary_table = compute_overall_survival_summary_table(survival_ready_df, config.time_unit)
-    st.subheader("Overall survival summary")
-    st.dataframe(
-        _format_survival_summary_display_table(overall_summary_table, config.time_unit),
-        hide_index=True,
-        width="stretch",
-    )
-    _render_dataframe_download(
-        "Download overall survival summary as CSV",
-        overall_summary_table,
-        "overall_survival_summary.csv",
-    )
-
     curve_df = combine_curve_results(plot_results)
     fig = plot_km_curve(
         curve_df,
@@ -1414,6 +1618,19 @@ def _render_survival_analysis_tab() -> None:
         key="survival_plot_image_format",
         filename="kaplan_meier_curve",
     )
+
+    overall_summary_table = compute_overall_survival_summary_table(survival_ready_df, config.time_unit)
+    with st.expander("Overall survival summary table"):
+        st.dataframe(
+            _format_survival_summary_display_table(overall_summary_table, config.time_unit),
+            hide_index=True,
+            width="stretch",
+        )
+        _render_dataframe_download(
+            "Download overall survival summary as CSV",
+            overall_summary_table,
+            "overall_survival_summary.csv",
+        )
 
     if use_group and has_group:
         st.subheader("Group-wise survival summary")
@@ -1534,13 +1751,14 @@ def _render_survival_filters(
     profile_df: pd.DataFrame | None,
     annotations: Any,
 ) -> pd.DataFrame | None:
-    st.subheader("Cohort filters")
     if uploaded_df is None:
+        st.session_state["active_survival_filters"] = {}
         return None
 
     filter_columns = get_columns_for_use(annotations, USE_FILTER, uploaded_df.columns)
     if not filter_columns:
-        st.caption("No columns are annotated as filters. Update Column annotations on Upload.")
+        st.caption("No columns are annotated as filters. Update Column annotations in Setup.")
+        st.session_state["active_survival_filters"] = {}
         return uploaded_df
 
     detected_types = (
@@ -1548,52 +1766,69 @@ def _render_survival_filters(
         if profile_df is not None and not profile_df.empty
         else {}
     )
+    _sanitize_multiselect_state("active_survival_filter_columns", filter_columns)
     selections: dict[str, tuple[str, Any]] = {}
-    for column in filter_columns:
-        series = uploaded_df[column]
-        detected_type = detected_types.get(column, "")
-        if detected_type in {"integer", "float"}:
-            numeric = pd.to_numeric(series, errors="coerce").dropna()
-            if numeric.empty or numeric.min() == numeric.max():
-                st.caption(f"{column}: no variable numeric range")
-                continue
-            lower, upper = float(numeric.min()), float(numeric.max())
-            selected = st.slider(
-                f"Filter by {column}",
-                lower,
-                upper,
-                (lower, upper),
-                key=f"survival_filter_{column}",
-            )
-            if tuple(selected) != (lower, upper):
-                selections[column] = ("numeric", selected)
-        elif detected_type == "date":
-            dates = pd.to_datetime(series, errors="coerce").dropna()
-            if dates.empty or dates.min().date() == dates.max().date():
-                st.caption(f"{column}: no variable date range")
-                continue
-            bounds = (dates.min().date(), dates.max().date())
-            selected = st.date_input(
-                f"Filter by {column}",
-                bounds,
-                min_value=bounds[0],
-                max_value=bounds[1],
-                key=f"survival_filter_{column}",
-            )
-            if len(selected) == 2 and tuple(selected) != bounds:
-                selections[column] = ("date", selected)
-        else:
-            options = sorted(series.dropna().unique().tolist(), key=str)
-            selected = st.multiselect(
-                f"Filter by {column}",
-                options,
-                default=[],
-                help="Leave empty to include all values.",
-                key=f"survival_filter_{column}",
-            )
-            if selected:
-                selections[column] = ("categorical", selected)
+    with st.expander("Cohort filters"):
+        selected_columns = st.multiselect(
+            "Add filter variables",
+            filter_columns,
+            default=[],
+            key="active_survival_filter_columns",
+            help="Only selected variables will show filter controls.",
+        )
+        if not selected_columns:
+            st.caption("No filters selected; the full mapped cohort is included.")
 
+        for column in selected_columns:
+            series = uploaded_df[column]
+            detected_type = detected_types.get(column, "")
+            if detected_type in {"integer", "float"}:
+                numeric = pd.to_numeric(series, errors="coerce").dropna()
+                if numeric.empty or numeric.min() == numeric.max():
+                    st.caption(f"{column}: no variable numeric range")
+                    continue
+                lower, upper = float(numeric.min()), float(numeric.max())
+                selected = st.slider(
+                    f"Filter by {column}",
+                    lower,
+                    upper,
+                    (lower, upper),
+                    key=f"survival_filter_{column}",
+                )
+                if tuple(selected) != (lower, upper):
+                    selections[column] = ("numeric", selected)
+            elif detected_type == "date":
+                dates = pd.to_datetime(series, errors="coerce").dropna()
+                if dates.empty or dates.min().date() == dates.max().date():
+                    st.caption(f"{column}: no variable date range")
+                    continue
+                bounds = (dates.min().date(), dates.max().date())
+                selected = st.date_input(
+                    f"Filter by {column}",
+                    bounds,
+                    min_value=bounds[0],
+                    max_value=bounds[1],
+                    key=f"survival_filter_{column}",
+                )
+                if len(selected) == 2 and tuple(selected) != bounds:
+                    selections[column] = ("date", selected)
+            else:
+                options = sorted(series.dropna().unique().tolist(), key=str)
+                selected = st.multiselect(
+                    f"Filter by {column}",
+                    options,
+                    default=[],
+                    help="Leave empty to include all values.",
+                    key=f"survival_filter_{column}",
+                )
+                if selected:
+                    selections[column] = ("categorical", selected)
+
+    st.session_state["active_survival_filters"] = selections
+    if selections:
+        st.caption("Active filters: " + ", ".join(selections))
+    else:
+        st.caption("Current cohort: all mapped rows")
     return _apply_survival_filters(uploaded_df, selections)
 
 
@@ -2224,9 +2459,6 @@ def _seed_survival_setup_widget_state(
 def _render_column_annotations(df: pd.DataFrame, profile: pd.DataFrame) -> None:
     st.subheader("Column annotations")
     config = st.session_state.get("survival_config")
-    if config is None:
-        st.info("Confirm the survival mapping to annotate how every column should be used.")
-        return
 
     annotations = sync_annotations(
         st.session_state.get("column_annotations"),
@@ -2238,7 +2470,7 @@ def _render_column_annotations(df: pd.DataFrame, profile: pd.DataFrame) -> None:
 
     st.caption(
         "Meaning describes what a column represents. Analysis uses are independent, so a column "
-        "can be available for filters, grouping, the baseline table, Cox modeling, and charts."
+        "can be available for filters, grouping, the baseline table, and charts."
     )
     editor_df = annotations_to_dataframe(annotations, profile)
     editor_version = int(st.session_state.get("annotation_editor_version", 0))
@@ -2265,8 +2497,12 @@ def _render_column_annotations(df: pd.DataFrame, profile: pd.DataFrame) -> None:
                     help="Required only when Meaning is Custom...",
                 ),
                 **{
-                    label: st.column_config.CheckboxColumn(label)
-                    for label in USE_COLUMN_LABELS.values()
+                    label: (
+                        None
+                        if use == USE_COX
+                        else st.column_config.CheckboxColumn(label)
+                    )
+                    for use, label in USE_COLUMN_LABELS.items()
                 },
             },
             key=f"column_annotation_editor_{editor_version}",
@@ -2306,59 +2542,65 @@ def _render_column_annotations(df: pd.DataFrame, profile: pd.DataFrame) -> None:
         st.success(status_message)
 
     summary = get_annotation_summary(st.session_state["column_annotations"])
-    summary_columns = st.columns(6)
+    summary_columns = st.columns(5)
     summary_columns[0].metric("Filters", summary[USE_FILTER])
     summary_columns[1].metric("Groups", summary[USE_GROUP])
     summary_columns[2].metric("Baseline", summary[USE_BASELINE])
-    summary_columns[3].metric("Cox", summary[USE_COX])
-    summary_columns[4].metric("Charts", summary[USE_CHARTS])
-    summary_columns[5].metric("Ignored", summary[USE_IGNORE])
-    st.caption("Cox covariate annotations are stored now and will be used when Cox modeling is added.")
+    summary_columns[3].metric("Charts", summary[USE_CHARTS])
+    summary_columns[4].metric("Ignored", summary[USE_IGNORE])
 
 
 def _render_export_section(df: pd.DataFrame, profile: pd.DataFrame) -> None:
-    st.subheader("Exports and configuration")
-    uploaded_config = st.file_uploader(
-        "Load mapping and annotation configuration",
-        type=["json"],
-        key="analysis_configuration_upload",
-        help="Configuration is validated against the currently uploaded dataset before use.",
+    st.download_button(
+        "Download current dataset as CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="current_dataset.csv",
+        mime="text/csv",
     )
-    if st.button(
-        "Apply uploaded configuration",
-        disabled=uploaded_config is None,
-    ):
-        try:
-            config, loaded_annotations = deserialize_analysis_configuration(
-                uploaded_config.getvalue()
-            )
-            errors, warnings = validate_survival_config(df, config)
-            if errors:
-                raise ValueError(" ".join(errors))
-        except ValueError as exc:
-            st.error(str(exc))
-        else:
-            st.session_state["survival_config"] = config
-            st.session_state["survival_ready_df"] = create_survival_ready_dataframe(
-                df,
-                config,
-            )
-            st.session_state["column_annotations"] = sync_annotations(
-                loaded_annotations,
-                df,
-                profile,
-                config,
-            )
-            st.session_state["pending_survival_setup_config"] = config
-            st.session_state["annotation_editor_version"] = (
-                int(st.session_state.get("annotation_editor_version", 0)) + 1
-            )
-            _invalidate_annotation_consumer_state()
-            st.session_state["configuration_status_message"] = (
-                "Mapping and annotations loaded."
-                + (f" Review: {' '.join(warnings)}" if warnings else "")
-            )
-            st.rerun()
+
+    with st.expander("Load a saved mapping and annotation configuration"):
+        uploaded_config = st.file_uploader(
+            "Configuration JSON",
+            type=["json"],
+            key="analysis_configuration_upload",
+            help="Configuration is validated against the currently uploaded dataset before use.",
+        )
+        if st.button(
+            "Apply uploaded configuration",
+            disabled=uploaded_config is None,
+        ):
+            try:
+                config, loaded_annotations = deserialize_analysis_configuration(
+                    uploaded_config.getvalue()
+                )
+                errors, warnings = validate_survival_config(df, config)
+                if errors:
+                    raise ValueError(" ".join(errors))
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state["survival_config"] = config
+                st.session_state["survival_ready_df"] = create_survival_ready_dataframe(
+                    df,
+                    config,
+                )
+                st.session_state["column_annotations"] = sync_annotations(
+                    loaded_annotations,
+                    df,
+                    profile,
+                    config,
+                )
+                st.session_state["pending_survival_setup_config"] = config
+                st.session_state["analysis_goal"] = ANALYSIS_GOAL_SURVIVAL
+                st.session_state["annotation_editor_version"] = (
+                    int(st.session_state.get("annotation_editor_version", 0)) + 1
+                )
+                _invalidate_annotation_consumer_state()
+                st.session_state["configuration_status_message"] = (
+                    "Mapping and annotations loaded."
+                    + (f" Review: {' '.join(warnings)}" if warnings else "")
+                )
+                st.rerun()
 
     status_message = st.session_state.pop("configuration_status_message", None)
     if status_message:
@@ -2367,7 +2609,10 @@ def _render_export_section(df: pd.DataFrame, profile: pd.DataFrame) -> None:
     config = st.session_state.get("survival_config")
     annotations = st.session_state.get("column_annotations")
     if config is None or not isinstance(annotations, dict):
-        st.caption("Confirm or load a survival mapping to enable data and report exports.")
+        st.info(
+            "The current dataset can be downloaded now. Confirm or load a survival "
+            "mapping to enable cleaned data, reusable configuration, and combined reports."
+        )
         return
 
     ready_df = create_survival_ready_dataframe(df, config)
@@ -2440,6 +2685,8 @@ def _invalidate_annotation_consumer_state() -> None:
         "chart_y_col",
         "chart_color_col",
         "survival_analysis_group_col",
+        "active_survival_filter_columns",
+        "active_survival_filters",
         "combined_report_html",
         "combined_report_pdf",
     ]:
@@ -2521,13 +2768,13 @@ def _render_candidate_recommendations(candidates: list[dict[str, Any]]) -> None:
         st.caption("No recommended candidates found. Use the search-all-columns selector.")
         return
 
-    st.caption("Recommended columns")
-    for candidate in candidates:
-        reasons = "; ".join(candidate["reasons"]) if candidate["reasons"] else "No specific reasons"
-        st.caption(
-            f"{candidate['column_name']} - {candidate['confidence']} confidence "
-            f"({candidate['score']}). Reasons: {reasons}"
-        )
+    with st.expander("Why these columns were recommended"):
+        for candidate in candidates:
+            reasons = "; ".join(candidate["reasons"]) if candidate["reasons"] else "No specific reasons"
+            st.caption(
+                f"{candidate['column_name']} - {candidate['confidence']} confidence "
+                f"({candidate['score']}). Reasons: {reasons}"
+            )
 
 
 def _format_candidate_option(option: str, candidates: list[dict[str, Any]]) -> str:
@@ -2608,32 +2855,33 @@ def _render_event_value_mapping(
     else:
         st.caption("All non-missing values are explicitly mapped.")
 
-    unmapped_choice = st.radio(
-        "Unmapped non-missing values",
-        [
-            "Exclude from survival analysis",
-            "Treat as censored",
-            "Treat as events",
-        ],
-        index=0,
-        key=f"unmapped_event_handling_{event_col}",
-        help=(
-            "Exclusion is the conservative default. Treating unknown values as censored "
-            "or as events can materially change survival estimates."
-        ),
-    )
-    unmapped_event_handling = {
-        "Treat as censored": "treat_as_censored",
-        "Treat as events": "treat_as_event",
-    }.get(unmapped_choice, "exclude")
+    with st.expander("Advanced event handling"):
+        unmapped_choice = st.radio(
+            "Unmapped non-missing values",
+            [
+                "Exclude from survival analysis",
+                "Treat as censored",
+                "Treat as events",
+            ],
+            index=0,
+            key=f"unmapped_event_handling_{event_col}",
+            help=(
+                "Exclusion is the conservative default. Treating unknown values as censored "
+                "or as events can materially change survival estimates."
+            ),
+        )
+        unmapped_event_handling = {
+            "Treat as censored": "treat_as_censored",
+            "Treat as events": "treat_as_event",
+        }.get(unmapped_choice, "exclude")
 
-    missing_choice = st.radio(
-        "Missing event values",
-        ["Exclude from survival analysis", "Treat as censored"],
-        index=0,
-        key=f"missing_event_handling_{event_col}",
-    )
-    missing_event_handling = "treat_as_censored" if missing_choice == "Treat as censored" else "exclude"
+        missing_choice = st.radio(
+            "Missing event values",
+            ["Exclude from survival analysis", "Treat as censored"],
+            index=0,
+            key=f"missing_event_handling_{event_col}",
+        )
+        missing_event_handling = "treat_as_censored" if missing_choice == "Treat as censored" else "exclude"
 
     return (
         event_values,
@@ -2645,7 +2893,12 @@ def _render_event_value_mapping(
 
 def _render_time_unit_selector(time_col: str) -> str:
     options = ["days", "months", "years", "unknown"]
-    suggested_unit = _suggest_time_unit(time_col)
+    suggested_unit = (
+        "days"
+        if st.session_state.get("loaded_example_dataset") == "lung.csv"
+        and time_col == "time"
+        else _suggest_time_unit(time_col)
+    )
     return str(
         st.selectbox(
             "Time unit",

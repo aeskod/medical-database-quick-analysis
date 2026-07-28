@@ -90,6 +90,12 @@ def test_valid_mapping_can_continue_to_data_quality():
         csv_bytes,
         "text/csv",
     ).run(timeout=30)
+    goal = next(
+        item for item in app_test.radio if item.label == "What would you like to do?"
+    )
+    app_test = goal.set_value("Run survival analysis").run(timeout=30)
+    navigation = next(item for item in app_test.radio if item.label == "Go to")
+    app_test = navigation.set_value("Setup").run(timeout=30)
     confirm = next(
         button
         for button in app_test.button

@@ -103,6 +103,12 @@ def test_uploaded_date_dataset_flows_through_all_dashboard_tabs():
         csv_bytes,
         "text/csv",
     ).run(timeout=30)
+    goal = next(
+        item for item in app_test.radio if item.label == "What would you like to do?"
+    )
+    app_test = goal.set_value("Run survival analysis").run(timeout=30)
+    navigation = next(item for item in app_test.radio if item.label == "Go to")
+    app_test = navigation.set_value("Setup").run(timeout=30)
     setup_mode = next(
         item for item in app_test.radio if item.label == "Survival time setup"
     )
@@ -127,6 +133,8 @@ def test_uploaded_date_dataset_flows_through_all_dashboard_tabs():
     assert annotations["diagnosis_date"].meaning == "Start time"
     assert annotations["death_date"].meaning == "Date"
     assert annotations["last_followup_date"].meaning == "End time"
+    navigation = next(item for item in app_test.radio if item.label == "Go to")
+    app_test = navigation.set_value("Survival Analysis").run(timeout=30)
     assert any(
         message.value == "Survival-ready data validated."
         for message in app_test.success
