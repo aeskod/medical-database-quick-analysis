@@ -136,3 +136,69 @@ def test_same_bytes_with_different_parser_extension_resets_analysis_state():
         "A different dataset was detected" in message.value
         for message in app_test.info
     )
+
+
+def test_clearing_uploader_clears_the_active_uploaded_dataset():
+    app_test = AppTest.from_file("app.py").run(timeout=30)
+    app_test = app_test.file_uploader[0].upload(
+        "clinical.csv",
+        FIRST_CSV,
+        "text/csv",
+    ).run(timeout=30)
+
+    app_test = app_test.file_uploader[0].clear().run(timeout=30)
+
+    assert not app_test.exception
+    assert "uploaded_df" not in app_test.session_state
+    assert "dataset_metadata" not in app_test.session_state
+    assert any(
+        "uploaded dataset was cleared" in message.value
+        for message in app_test.info
+    )
+
+
+def test_invalid_replacement_keeps_previous_dataset_explicitly_active():
+    app_test = AppTest.from_file("app.py").run(timeout=30)
+    app_test = app_test.file_uploader[0].upload(
+        "clinical.csv",
+        FIRST_CSV,
+        "text/csv",
+    ).run(timeout=30)
+
+    app_test = app_test.file_uploader[0].clear().upload(
+        "broken.csv",
+        b"a,b\n1,2,3\n",
+        "text/csv",
+    ).run(timeout=30)
+
+    assert not app_test.exception
+    pd.testing.assert_frame_equal(
+        app_test.session_state["uploaded_df"],
+        pd.DataFrame({"time": [10, 20], "status": [1, 0]}),
+    )
+    assert any(
+        "previous dataset remains active" in message.value
+        for message in app_test.warning
+    )
+
+
+def test_example_can_replace_a_still_selected_upload():
+    app_test = AppTest.from_file("app.py").run(timeout=30)
+    app_test = app_test.file_uploader[0].upload(
+        "clinical.csv",
+        FIRST_CSV,
+        "text/csv",
+    ).run(timeout=30)
+    load_example = next(
+        button for button in app_test.button if button.label == "Load example dataset"
+    )
+
+    app_test = load_example.click().run(timeout=30)
+
+    assert not app_test.exception
+    assert app_test.session_state["dataset_metadata"].file_name == "lung.csv"
+    assert app_test.session_state["dataset_source"] == "example"
+    assert any(
+        button.label == "Use selected upload"
+        for button in app_test.button
+    )

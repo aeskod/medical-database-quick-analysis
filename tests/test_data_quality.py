@@ -164,6 +164,24 @@ def test_compute_survival_quality_bad_values():
     assert any(issue.severity == "error" for issue in survival_quality["issues"])
 
 
+def test_survival_quality_reports_and_excludes_infinite_time():
+    df = pd.DataFrame(
+        {"time": [10, float("inf"), 30], "status": [1, 0, 1]}
+    )
+    config = SurvivalConfig(
+        time_col="time",
+        event_col="status",
+        event_values=[1],
+        censor_values=[0],
+    )
+
+    quality = compute_survival_quality(df, config)
+
+    assert quality["infinite_time_count"] == 1
+    assert quality["usable_survival_rows"] == 2
+    assert any("infinite" in issue.message for issue in quality["issues"])
+
+
 def test_survival_quality_counts_missing_as_censored_consistently():
     df = pd.DataFrame(
         {

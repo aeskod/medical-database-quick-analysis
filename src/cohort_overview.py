@@ -1,9 +1,11 @@
 import re
+from numbers import Integral, Real
 from typing import Any, Mapping
 
 import pandas as pd
 
 from src.profiling import normalize_missing_values, profile_dataframe
+from src.survival_analysis import get_survival_summary
 
 
 ID_NAME_HINTS = ["id", "patient_id", "subject_id", "record_id", "case_id", "mrn"]
@@ -29,6 +31,9 @@ CONTINUOUS_NAME_HINTS = [
     "lab",
     "level",
     "score",
+    "amount",
+    "measure",
+    "measurement",
     "dose",
     "count",
 ]
@@ -57,6 +62,7 @@ def compute_cohort_overview_metrics(
     total_cells = n_rows * n_columns
     missing_cells = int(source_df.isna().sum().sum()) if total_cells else 0
     has_patient_id = id_col is not None and id_col in source_df.columns
+    patient_df = _patient_level_dataframe(source_df, id_col)
     n_patients = (
         int(source_df[id_col].nunique(dropna=True))
         if has_patient_id
@@ -64,8 +70,8 @@ def compute_cohort_overview_metrics(
     )
     missing_patient_ids = int(source_df[id_col].isna().sum()) if has_patient_id else None
     age = (
-        pd.to_numeric(source_df[age_col], errors="coerce").dropna()
-        if age_col is not None and age_col in source_df.columns
+        pd.to_numeric(patient_df[age_col], errors="coerce").dropna()
+        if age_col is not None and age_col in patient_df.columns
         else pd.Series(dtype=float)
     )
 
@@ -93,12 +99,15 @@ def compute_cohort_overview_metrics(
         return metrics
 
     survival_df = survival_ready_df.copy(deep=True)
+    if has_patient_id and "_id" in survival_df.columns:
+        survival_df = _patient_level_dataframe(survival_df, "_id")
     survival_df["_time"] = pd.to_numeric(survival_df["_time"], errors="coerce")
     survival_df["_event"] = pd.to_numeric(survival_df["_event"], errors="coerce")
     survival_df = survival_df.dropna(subset=["_time", "_event"])
-    usable_rows = len(survival_df)
-    events = int((survival_df["_event"] == 1).sum())
-    censored = int((survival_df["_event"] == 0).sum())
+    survival_summary = get_survival_summary(survival_df, time_unit)
+    usable_rows = survival_summary["n"]
+    events = survival_summary["events"]
+    censored = survival_summary["censored"]
 
     metrics.update(
         {
@@ -106,8 +115,8 @@ def compute_cohort_overview_metrics(
             "events": events,
             "censored": censored,
             "event_rate": round((events / usable_rows * 100) if usable_rows else 0.0, 2),
-            "median_followup": round(float(survival_df["_time"].median()), 2) if usable_rows else None,
-            "max_followup": round(float(survival_df["_time"].max()), 2) if usable_rows else None,
+            "median_followup": survival_summary["median_followup"],
+            "max_followup": survival_summary["max_followup"],
         }
     )
     return metrics
@@ -183,7 +192,7 @@ def classify_summary_variable(
         return "categorical"
 
     if numeric_parse_rate >= 0.95 and not is_binary_like:
-        if unique_count > 10 or has_continuous_name_hint:
+        if detected_type == "float" or unique_count > 10 or has_continuous_name_hint:
             return "continuous"
 
     if is_binary_like or detected_type in {"boolean", "categorical"} or 2 <= unique_count <= 20:
@@ -282,15 +291,19 @@ def summarize_categorical_variable(
     normalized = normalize_missing_values(df[[column]])[column]
     total_count = len(normalized)
     non_missing = normalized.dropna()
-    non_missing_count = len(non_missing)
-    level_counts = _collapsed_value_counts(non_missing, max_levels)
+    level_plan = _categorical_level_plan(non_missing, max_levels)
+    level_counts = _counts_for_categorical_plan(non_missing, level_plan)
+    denominator = total_count if include_missing else len(non_missing)
     rows = [
         {
             "variable": column,
-            "level": str(level),
+            "level": level,
             "count": int(count),
-            "percent": round((int(count) / non_missing_count * 100) if non_missing_count else 0.0, 2),
-            "summary": _format_count_percent(int(count), (int(count) / non_missing_count * 100) if non_missing_count else 0.0),
+            "percent": round((int(count) / denominator * 100) if denominator else 0.0, 2),
+            "summary": _format_count_percent(
+                int(count),
+                (int(count) / denominator * 100) if denominator else 0.0,
+            ),
         }
         for level, count in level_counts.items()
     ]
@@ -368,57 +381,56 @@ def build_baseline_table(
     id_col: str | None = None,
 ) -> pd.DataFrame:
     normalized = normalize_missing_values(df)
+    analysis_df = _patient_level_dataframe(normalized, id_col)
     continuous_vars = [variable for variable in continuous_vars if variable != group_col]
     categorical_vars = [variable for variable in categorical_vars if variable != group_col]
-    group_values = _group_values(normalized, group_col)
+    group_values = _group_values(analysis_df, group_col)
     group_value_labels = group_value_labels or {}
+    group_columns = _unique_group_display_labels(group_values, group_value_labels)
     rows = _baseline_summary_rows(
-        normalized,
+        analysis_df,
         group_col,
         group_values,
-        group_value_labels,
+        group_columns,
         survival_ready_df,
         id_col,
     )
 
     for variable in continuous_vars:
-        if variable not in normalized.columns:
+        if variable not in analysis_df.columns:
             continue
 
         row = {
             "Variable": variable,
-            "Overall": summarize_continuous_variable(normalized, variable)["summary"],
+            "Overall": summarize_continuous_variable(analysis_df, variable)["summary"],
         }
         if group_col:
-            group_summary = summarize_continuous_by_group(normalized, variable, group_col)
-            summary_by_group = dict(zip(group_summary["group"], group_summary["summary"]))
             for group_value in group_values:
-                row[_display_group_value(group_value, group_value_labels)] = summary_by_group.get(
-                    str(group_value),
-                    "Not available",
+                group_df = analysis_df[
+                    analysis_df[group_col].map(_typed_value_key)
+                    == _typed_value_key(group_value)
+                ]
+                row[group_columns[_typed_value_key(group_value)]] = (
+                    summarize_continuous_variable(group_df, variable)["summary"]
                 )
         rows.append(row)
 
     for variable in categorical_vars:
-        if variable not in normalized.columns:
+        if variable not in analysis_df.columns:
             continue
 
-        overall_summary = summarize_categorical_variable(
-            normalized,
-            variable,
-            max_levels=max_levels,
-            include_missing=include_missing,
+        normalized_variable = normalize_missing_values(
+            analysis_df[[variable]]
+        )[variable]
+        level_plan = _categorical_level_plan(
+            normalized_variable.dropna(),
+            max_levels,
         )
-        group_summary = (
-            summarize_categorical_by_group(
-                normalized,
-                variable,
-                group_col,
-                max_levels=max_levels,
-                include_missing=include_missing,
-            )
-            if group_col
-            else pd.DataFrame(columns=["group", "variable", "level", "count", "percent", "summary"])
+        overall_summary = _summarize_categorical_with_plan(
+            normalized_variable,
+            variable,
+            level_plan,
+            include_missing,
         )
 
         for _, summary_row in overall_summary.iterrows():
@@ -428,20 +440,25 @@ def build_baseline_table(
                 "Overall": summary_row["summary"],
             }
             for group_value in group_values:
-                group_label = str(group_value)
-                matching = group_summary[
-                    (group_summary["group"] == group_label)
-                    & (group_summary["variable"] == variable)
-                    & (group_summary["level"].astype(str) == level)
+                group_df = analysis_df[
+                    analysis_df[group_col].map(_typed_value_key)
+                    == _typed_value_key(group_value)
                 ]
-                table_row[_display_group_value(group_value, group_value_labels)] = (
+                group_summary = _summarize_categorical_with_plan(
+                    normalize_missing_values(group_df[[variable]])[variable],
+                    variable,
+                    level_plan,
+                    include_missing,
+                    include_zero_levels=True,
+                )
+                matching = group_summary[group_summary["level"].astype(str) == level]
+                table_row[group_columns[_typed_value_key(group_value)]] = (
                     matching["summary"].iloc[0] if not matching.empty else "0 (0.00%)"
                 )
             rows.append(table_row)
 
     columns = ["Variable", "Overall"] + [
-        _display_group_value(group_value, group_value_labels)
-        for group_value in group_values
+        group_columns[_typed_value_key(group_value)] for group_value in group_values
     ]
     return pd.DataFrame(rows, columns=columns)
 
@@ -449,22 +466,29 @@ def build_baseline_table(
 def _baseline_summary_rows(
     df: pd.DataFrame,
     group_col: str | None,
-    group_values: list[str],
-    group_value_labels: dict[str, str],
+    group_values: list[Any],
+    group_columns: dict[str, str],
     survival_ready_df: pd.DataFrame | None,
     id_col: str | None,
 ) -> list[dict[str, str]]:
     count_row = {"Variable": "n", "Overall": str(_patient_count(df, id_col))}
     for group_value in group_values:
-        group_df = df[df[group_col].astype(str) == group_value]
-        count_row[_display_group_value(group_value, group_value_labels)] = str(
+        group_df = df[
+            df[group_col].map(_typed_value_key) == _typed_value_key(group_value)
+        ]
+        count_row[group_columns[_typed_value_key(group_value)]] = str(
             _patient_count(group_df, id_col)
         )
 
     event_row = {"Variable": "Events, n (%)", "Overall": "Not available"}
-    followup_row = {"Variable": "Follow-up, median [IQR]", "Overall": "Not available"}
+    followup_row = {
+        "Variable": "Observed duration, median [IQR]",
+        "Overall": "Not available",
+    }
     if survival_ready_df is not None:
         survival_df = survival_ready_df.copy(deep=True)
+        if id_col is not None and "_id" in survival_df.columns:
+            survival_df = _patient_level_dataframe(survival_df, "_id")
         survival_df["_time"] = pd.to_numeric(survival_df["_time"], errors="coerce")
         survival_df["_event"] = pd.to_numeric(survival_df["_event"], errors="coerce")
         survival_df = survival_df.dropna(subset=["_time", "_event"])
@@ -472,19 +496,20 @@ def _baseline_summary_rows(
         followup_row["Overall"] = _followup_summary(survival_df)
 
         for group_value in group_values:
-            column = _display_group_value(group_value, group_value_labels)
+            column = group_columns[_typed_value_key(group_value)]
             if "_group" not in survival_df.columns:
                 event_row[column] = "Not available"
                 followup_row[column] = "Not available"
                 continue
             group_survival_df = survival_df[
-                survival_df["_group"].astype(str) == group_value
+                survival_df["_group"].map(_typed_value_key)
+                == _typed_value_key(group_value)
             ]
             event_row[column] = _event_summary(group_survival_df)
             followup_row[column] = _followup_summary(group_survival_df)
     else:
         for group_value in group_values:
-            column = _display_group_value(group_value, group_value_labels)
+            column = group_columns[_typed_value_key(group_value)]
             event_row[column] = "Not available"
             followup_row[column] = "Not available"
 
@@ -616,31 +641,191 @@ def _looks_like_free_text(series: pd.Series) -> bool:
     return text_values.str.len().mean() > TEXT_LENGTH_THRESHOLD or unique_ratio > 0.8
 
 
-def _collapsed_value_counts(series: pd.Series, max_levels: int) -> dict[str, int]:
-    value_counts = series.astype(str).value_counts(sort=False)
-    value_counts = value_counts.sort_index(kind="stable").sort_values(ascending=False, kind="stable")
+def _categorical_level_plan(
+    series: pd.Series,
+    max_levels: int,
+) -> dict[str, Any]:
+    values_by_key: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    for value in series.dropna():
+        key = _typed_value_key(value)
+        values_by_key.setdefault(key, value)
+        counts[key] = counts.get(key, 0) + 1
 
-    if len(value_counts) <= max_levels:
-        return {str(level): int(count) for level, count in value_counts.items()}
+    ordered_keys = sorted(
+        counts,
+        key=lambda key: (-counts[key], str(values_by_key[key]), key),
+    )
+    top_keys = ordered_keys[: max(1, int(max_levels))]
+    collapsed_keys = set(ordered_keys[len(top_keys) :])
+    labels: dict[str, str] = {}
+    used_labels: set[str] = {"Missing"}
+    order: list[str] = []
+    for key in top_keys:
+        raw_label = str(values_by_key[key])
+        if raw_label == "Missing":
+            raw_label = "Missing (value)"
+        label = raw_label
+        suffix = 2
+        while label in used_labels:
+            label = f"{raw_label} [{type(values_by_key[key]).__name__} #{suffix}]"
+            suffix += 1
+        labels[key] = label
+        used_labels.add(label)
+        order.append(label)
 
-    top_counts = value_counts.iloc[:max_levels]
-    other_count = int(value_counts.iloc[max_levels:].sum())
-    result = {str(level): int(count) for level, count in top_counts.items()}
-    result["Other"] = other_count
-    return result
+    collapsed_label = None
+    if collapsed_keys:
+        collapsed_label = "Other (collapsed)"
+        suffix = 2
+        while collapsed_label in used_labels:
+            collapsed_label = f"Other (collapsed #{suffix})"
+            suffix += 1
+        order.append(collapsed_label)
+
+    return {
+        "labels": labels,
+        "top_keys": set(top_keys),
+        "collapsed_keys": collapsed_keys,
+        "collapsed_label": collapsed_label,
+        "order": order,
+    }
 
 
-def _group_values(df: pd.DataFrame, group_col: str | None) -> list[str]:
+def _counts_for_categorical_plan(
+    series: pd.Series,
+    plan: dict[str, Any],
+) -> dict[str, int]:
+    counts = {str(label): 0 for label in plan["order"]}
+    for value in series.dropna():
+        key = _typed_value_key(value)
+        if key in plan["top_keys"]:
+            label = plan["labels"][key]
+        else:
+            label = plan["collapsed_label"]
+            if label is None:
+                continue
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _summarize_categorical_with_plan(
+    series: pd.Series,
+    variable: str,
+    plan: dict[str, Any],
+    include_missing: bool,
+    *,
+    include_zero_levels: bool = False,
+) -> pd.DataFrame:
+    total_count = len(series)
+    non_missing = series.dropna()
+    denominator = total_count if include_missing else len(non_missing)
+    counts = _counts_for_categorical_plan(non_missing, plan)
+    rows = []
+    for level, count in counts.items():
+        if count == 0 and not include_zero_levels:
+            continue
+        percent = count / denominator * 100 if denominator else 0.0
+        rows.append(
+            {
+                "variable": variable,
+                "level": level,
+                "count": int(count),
+                "percent": round(percent, 2),
+                "summary": _format_count_percent(int(count), percent),
+            }
+        )
+
+    missing_count = int(series.isna().sum())
+    if include_missing and (missing_count > 0 or include_zero_levels):
+        percent = missing_count / total_count * 100 if total_count else 0.0
+        rows.append(
+            {
+                "variable": variable,
+                "level": "Missing",
+                "count": missing_count,
+                "percent": round(percent, 2),
+                "summary": _format_count_percent(missing_count, percent),
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=["variable", "level", "count", "percent", "summary"],
+    )
+
+
+def _patient_level_dataframe(
+    df: pd.DataFrame,
+    id_col: str | None,
+) -> pd.DataFrame:
+    if id_col is None or id_col not in df.columns:
+        return df.copy(deep=True)
+    identified = df.dropna(subset=[id_col]).copy()
+    if identified.empty:
+        return identified
+    keys = identified[id_col].map(_typed_value_key)
+    patient_rows = []
+    for key in pd.unique(keys):
+        patient_records = identified.loc[keys.eq(key)]
+        row = {}
+        for column in identified.columns:
+            non_missing = patient_records[column].dropna()
+            row[column] = non_missing.iloc[0] if not non_missing.empty else pd.NA
+        patient_rows.append(row)
+    return pd.DataFrame(patient_rows, columns=df.columns)
+
+
+def _group_values(df: pd.DataFrame, group_col: str | None) -> list[Any]:
     if not group_col or group_col not in df.columns:
         return []
 
-    values = df[group_col].dropna().astype(str).unique().tolist()
-    return sorted(values)
+    values_by_key: dict[str, Any] = {}
+    for value in df[group_col].dropna():
+        values_by_key.setdefault(_typed_value_key(value), value)
+    return [values_by_key[key] for key in sorted(values_by_key)]
 
 
 def _display_group_value(value: Any, group_value_labels: dict[str, str]) -> str:
     value_string = str(value)
-    return group_value_labels.get(value_string, value_string)
+    typed_key = (
+        f"{type(value).__module__}.{type(value).__qualname__}:{value!r}"
+    )
+    return group_value_labels.get(
+        typed_key,
+        group_value_labels.get(value_string, value_string),
+    )
+
+
+def _unique_group_display_labels(
+    values: list[Any],
+    group_value_labels: dict[str, str],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    used: set[str] = set()
+    for value in values:
+        base = _display_group_value(value, group_value_labels)
+        label = base
+        suffix = 2
+        while label in used or label in {"Variable", "Overall"}:
+            label = f"{base} [{type(value).__name__} #{suffix}]"
+            suffix += 1
+        used.add(label)
+        result[_typed_value_key(value)] = label
+    return result
+
+
+def _typed_value_key(value: Any) -> str:
+    if isinstance(value, bool):
+        return f"bool:{value}"
+    if isinstance(value, Integral):
+        return f"integer:{int(value)}"
+    if isinstance(value, Real):
+        if pd.isna(value):
+            return "missing"
+        if float(value).is_integer():
+            return f"integer:{int(value)}"
+        return f"number:{float(value)!r}"
+    return f"{type(value).__name__}:{value!r}"
 
 
 def _format_count_percent(count: int, percent: float) -> str:

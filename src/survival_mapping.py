@@ -14,6 +14,7 @@ ALLOWED_UNMAPPED_EVENT_HANDLING = {
     "treat_as_event",
 }
 ALLOWED_TIME_SOURCES = {"duration", "dates"}
+ALLOWED_TIME_UNITS = {"unknown", "days", "weeks", "months", "years"}
 
 
 @dataclass
@@ -43,6 +44,10 @@ def validate_survival_config(
 
     if config.time_source not in ALLOWED_TIME_SOURCES:
         errors.append("Time source must be 'duration' or 'dates'.")
+    if config.time_unit not in ALLOWED_TIME_UNITS:
+        errors.append(
+            "Time unit must be one of: unknown, days, weeks, months, or years."
+        )
 
     if config.missing_event_handling not in ALLOWED_MISSING_EVENT_HANDLING:
         errors.append("Missing event handling must be 'exclude' or 'treat_as_censored'.")
@@ -52,6 +57,8 @@ def validate_survival_config(
             "Unmapped event handling must be 'exclude', "
             "'treat_as_censored', or 'treat_as_event'."
         )
+
+    _validate_role_collisions(config, errors)
 
     if config.time_source == "dates":
         _validate_date_derivation(normalized, config, errors, warnings)
@@ -82,6 +89,10 @@ def validate_survival_config(
                 errors.append("Time column must contain numeric values.")
 
             parsed_non_missing_time = parsed_time.dropna()
+            if not parsed_non_missing_time.empty and not np.isfinite(
+                parsed_non_missing_time.astype(float)
+            ).all():
+                errors.append("Time column contains infinite values.")
             if not parsed_non_missing_time.empty and (parsed_non_missing_time < 0).any():
                 errors.append("Time column contains negative values.")
             if time_series.isna().any():
@@ -202,7 +213,9 @@ def create_survival_ready_dataframe(df: pd.DataFrame, config: SurvivalConfig) ->
         for column in ["_time", "_event", "_id", "_group"]
         if column in survival_df
     ]
-    return survival_df.dropna(subset=["_time", "_event"])[columns].reset_index(drop=True)
+    usable = survival_df.dropna(subset=["_time", "_event"])
+    usable = usable[np.isfinite(pd.to_numeric(usable["_time"], errors="coerce"))]
+    return usable[columns].reset_index(drop=True)
 
 
 def create_cleaned_mapped_dataframe(
@@ -212,10 +225,19 @@ def create_cleaned_mapped_dataframe(
     normalized = normalize_missing_values(df)
     survival_df = _create_survival_columns(normalized, config)
     result = normalized.copy(deep=True)
+    output_names: dict[str, str] = {}
     for column in ["_time", "_event", "_id", "_group"]:
         if column in survival_df:
-            result[column] = survival_df[column]
-    return result.dropna(subset=["_time", "_event"]).reset_index(drop=True)
+            output_name = _unique_output_name(column, result.columns)
+            output_names[column] = output_name
+            result[output_name] = survival_df[column]
+    time_output = output_names["_time"]
+    event_output = output_names["_event"]
+    usable = result.dropna(subset=[time_output, event_output])
+    usable = usable[
+        np.isfinite(pd.to_numeric(usable[time_output], errors="coerce"))
+    ]
+    return usable.reset_index(drop=True)
 
 
 def _create_survival_columns(
@@ -322,9 +344,87 @@ def _validate_date_derivation(
         )
         warnings.append(f"Event date is missing for some rows; those rows {action}.")
 
+    for label, column in columns.items():
+        ambiguous_count = _ambiguous_date_count(normalized[column])
+        if ambiguous_count:
+            errors.append(
+                f"{label} column '{column}' contains {ambiguous_count} ambiguous "
+                "day/month date value(s); use ISO YYYY-MM-DD format."
+            )
+
+    event_dates = _parse_dates(normalized[config.event_date_col])
+    last_followup_dates = _parse_dates(normalized[config.last_followup_date_col])
+    event_after_followup = (
+        event_dates.notna()
+        & last_followup_dates.notna()
+        & (event_dates > last_followup_dates)
+    )
+    if event_after_followup.any():
+        errors.append(
+            "Event date occurs after last follow-up date in "
+            f"{int(event_after_followup.sum())} row(s)."
+        )
+
 
 def _parse_dates(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", format="mixed", utc=True)
+
+
+def _validate_role_collisions(config: SurvivalConfig, errors: list[str]) -> None:
+    if config.time_source == "dates":
+        roles = {
+            "start date": config.start_date_col,
+            "event date": config.event_date_col,
+            "last follow-up date": config.last_followup_date_col,
+            "patient ID": config.id_col,
+            "group": config.group_col,
+        }
+    else:
+        roles = {
+            "time": config.time_col,
+            "event": config.event_col,
+            "patient ID": config.id_col,
+            "group": config.group_col,
+        }
+    selected: dict[str, list[str]] = {}
+    for role, column in roles.items():
+        if column is not None:
+            selected.setdefault(column, []).append(role)
+    collisions = [
+        f"'{column}' ({', '.join(role_names)})"
+        for column, role_names in selected.items()
+        if len(role_names) > 1
+    ]
+    if collisions:
+        errors.append(
+            "Each analysis role must use a different column. Conflicts: "
+            + "; ".join(collisions)
+            + "."
+        )
+
+
+def _ambiguous_date_count(series: pd.Series) -> int:
+    text = series.dropna().astype(str).str.strip()
+    parts = text.str.extract(
+        r"^(?P<first>\d{1,2})[/-](?P<second>\d{1,2})[/-](?P<year>\d{2,4})(?:\D.*)?$"
+    )
+    first = pd.to_numeric(parts["first"], errors="coerce")
+    second = pd.to_numeric(parts["second"], errors="coerce")
+    ambiguous = first.between(1, 12) & second.between(1, 12) & first.ne(second)
+    return int(ambiguous.sum())
+
+
+def _unique_output_name(preferred: str, existing_columns: Any) -> str:
+    existing = {str(column) for column in existing_columns}
+    if preferred not in existing:
+        return preferred
+    base = preferred + "_mapped"
+    candidate = base
+    suffix = 2
+    while candidate in existing:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _canonical_value(value: Any) -> str:

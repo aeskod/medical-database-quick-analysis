@@ -125,3 +125,40 @@ def test_profile_dataframe_returns_required_columns_and_values():
     assert status_profile["numeric_parse_rate"] == 0.0
     assert bool(status_profile["is_binary_like"]) is True
     assert bool(status_profile["is_low_cardinality"]) is True
+
+
+def test_datetime_dtype_is_not_profiled_as_integer_nanoseconds():
+    df = pd.DataFrame(
+        {"visit_date": pd.to_datetime(["2024-01-01", "2024-02-01"])}
+    )
+
+    profile = profile_dataframe(df).iloc[0]
+
+    assert profile["detected_type"] == "date"
+    assert profile["numeric_parse_rate"] == 0
+    assert profile["date_parse_rate"] == 1
+    assert profile["min_value"] is None
+    assert profile["max_value"] is None
+
+
+def test_mostly_numeric_strings_with_bad_token_are_mixed_not_dates():
+    series = pd.Series(["1", "2", "3", "4", "bad"], name="creatinine")
+
+    assert infer_column_type(series) == "mixed"
+    profile = profile_dataframe(series.to_frame()).iloc[0]
+    assert profile["date_parse_rate"] == 0
+
+
+def test_id_hint_matching_does_not_use_substrings_inside_measurement_names():
+    df = pd.DataFrame(
+        {
+            "lipid_level": list(range(20)),
+            "fluid_amount": [value / 10 for value in range(20)],
+            "rapid_score": list(range(20)),
+            "valid_measure": [value / 2 for value in range(20)],
+        }
+    )
+
+    profile = profile_dataframe(df)
+
+    assert not profile["is_id_like"].any()

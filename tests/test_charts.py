@@ -13,6 +13,7 @@ from src.charts import (
     plot_missingness_bar,
     plot_missingness_heatmap,
     plot_scatter,
+    plot_time_series,
     plot_violin,
     prepare_categorical_series,
     recommend_chart_type,
@@ -94,6 +95,18 @@ def test_prepare_categorical_series_collapses_rare_levels():
     assert prepared.nunique() <= 4
 
 
+def test_prepare_categorical_series_preserves_real_other_level():
+    df = pd.DataFrame(
+        {"diagnosis": ["Other", "A", "B", "C", "Missing", None]}
+    )
+
+    prepared = prepare_categorical_series(df, "diagnosis", max_levels=2)
+
+    assert "Other" in set(prepared)
+    assert "Other (collapsed)" in set(prepared)
+    assert "Missing" in set(prepared)
+
+
 def test_build_chart_dataframe_does_not_mutate_input_and_drops_required_numeric_missing():
     df = pd.DataFrame(
         {
@@ -124,6 +137,7 @@ def test_histogram_includes_marginal_box_plot():
 
     assert isinstance(figure, go.Figure)
     assert {trace.type for trace in figure.data} == {"histogram", "box"}
+    assert figure.layout.yaxis2.matches is None
 
 
 def test_bar_chart_returns_figure():
@@ -255,6 +269,7 @@ def test_missingness_heatmap_marks_normalized_missing_values_and_caps_rows():
     assert figure.data[0].z.tolist() == [[0, 1], [1, 0]]
     assert list(figure.data[0].y) == ["a", "b"]
     assert list(figure.data[0].x) == ["0", "1"]
+    assert any("Showing first 2 of 3 rows" in item.text for item in figure.layout.annotations)
 
 
 def test_correlation_heatmap_requires_two_numeric_columns():
@@ -266,6 +281,18 @@ def test_correlation_heatmap_requires_two_numeric_columns():
     result = build_chart(df, chart_type="correlation_heatmap")
     assert result["fig"] is None
     assert any("requires at least two numeric variables" in warning for warning in result["warnings"])
+
+
+def test_correlation_heatmap_rejects_constant_numeric_columns():
+    df = pd.DataFrame(
+        {
+            "age": [50, 60, 70],
+            "constant": [1, 1, 1],
+        }
+    )
+
+    with pytest.raises(ValueError, match="non-constant values"):
+        plot_correlation_heatmap(df)
 
 
 def test_build_chart_auto_returns_histogram_with_box_plot():
@@ -292,3 +319,45 @@ def test_build_chart_returns_violin_for_valid_variables():
     assert isinstance(result["fig"], go.Figure)
     assert all(trace.type == "violin" for trace in result["fig"].data)
     assert result["warnings"] == []
+
+
+def test_datetime_and_numeric_variables_produce_time_series():
+    df = pd.DataFrame(
+        {
+            "visit_date": pd.to_datetime(
+                ["2024-01-01", "2024-02-01", "2024-03-01"]
+            ),
+            "weight": [70.0, 69.5, 69.0],
+        }
+    )
+
+    assert recommend_chart_type("visit_date", "weight", df) == "line"
+    result = build_chart(
+        df,
+        chart_type="auto",
+        x_col="visit_date",
+        y_col="weight",
+    )
+
+    assert result["chart_type"] == "line"
+    assert isinstance(result["fig"], go.Figure)
+    assert isinstance(plot_time_series(df, "visit_date", "weight"), go.Figure)
+
+
+def test_numeric_color_is_ignored_for_histogram_instead_of_creating_one_trace_per_value():
+    df = pd.DataFrame(
+        {
+            "age": list(range(20, 40)),
+            "weight": [60 + value / 10 for value in range(20)],
+        }
+    )
+
+    result = build_chart(
+        df,
+        chart_type="histogram",
+        x_col="age",
+        color_col="weight",
+    )
+
+    assert len(result["fig"].data) == 2  # histogram + marginal box
+    assert any("Numeric color" in warning for warning in result["warnings"])

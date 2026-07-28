@@ -9,6 +9,7 @@ from src.data_quality import build_data_quality_report
 from src.exports import (
     build_html_report,
     build_pdf_report,
+    dataframe_to_safe_csv_bytes,
     deserialize_analysis_configuration,
     serialize_analysis_configuration,
 )
@@ -96,6 +97,56 @@ def test_configuration_loader_rejects_unknown_annotation_uses():
 
     with pytest.raises(ValueError, match="Annotation uses"):
         deserialize_analysis_configuration(json.dumps(payload))
+
+
+def test_csv_export_neutralizes_spreadsheet_formulas_in_cells_and_headers():
+    frame = pd.DataFrame(
+        {
+            "=danger": ["=1+1", "+cmd", "-2+3", "@SUM(A1:A2)", "safe"],
+            "number": [-2, 3, 4, 5, "  =hidden"],
+        }
+    )
+
+    exported = dataframe_to_safe_csv_bytes(frame).decode("utf-8")
+
+    assert exported.splitlines()[0].startswith("'=danger,")
+    assert "'=1+1" in exported
+    assert "'+cmd" in exported
+    assert "'-2+3" in exported
+    assert "'@SUM(A1:A2)" in exported
+    assert "'  =hidden" in exported
+    assert "\n-2," not in exported
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("time_col", 123, "must be text or null"),
+        ("time_unit", "fortnights", "Unsupported time unit"),
+        ("event_values", [["nested"]], "must contain scalar"),
+    ],
+)
+def test_configuration_loader_rejects_invalid_mapping_types(field, value, message):
+    payload = json.loads(
+        serialize_analysis_configuration(_config(), _annotations()).decode()
+    )
+    payload["survival_mapping"][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        deserialize_analysis_configuration(json.dumps(payload))
+
+
+def test_configuration_serializer_handles_timestamp_and_nonfinite_values():
+    config = _config()
+    config.event_values = [pd.Timestamp("2024-01-01"), float("nan")]
+
+    encoded = serialize_analysis_configuration(config, _annotations())
+    payload = json.loads(encoded)
+
+    assert payload["survival_mapping"]["event_values"] == [
+        "2024-01-01T00:00:00",
+        None,
+    ]
 
 
 def test_combined_reports_include_escaped_sections_and_valid_pdf_bytes():

@@ -1,6 +1,7 @@
 from dataclasses import replace
 from html import escape
 from io import BytesIO
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,7 @@ from src.data_loading import (
 from src.exports import (
     build_html_report,
     build_pdf_report,
+    dataframe_to_safe_csv_bytes,
     deserialize_analysis_configuration,
     serialize_analysis_configuration,
 )
@@ -112,6 +114,7 @@ DATASET_DERIVED_SESSION_KEYS = {
     "configuration_status_message",
     "analysis_configuration_upload",
     "pending_survival_setup_config",
+    "survival_confirmation_message",
     "combined_report_html",
     "combined_report_pdf",
     "show_more_preview_rows",
@@ -166,6 +169,7 @@ def main() -> None:
         "survival analysis when follow-up data are available."
     )
     page = _render_sidebar_navigation()
+    _reset_view_after_navigation(page)
 
     if page == "Dataset":
         _render_dataset_page()
@@ -183,6 +187,43 @@ def main() -> None:
         _render_export_page()
 
 
+def _reset_view_after_navigation(page: str) -> None:
+    previous_page = st.session_state.get("_last_rendered_main_tab")
+    st.session_state["_last_rendered_main_tab"] = page
+    if previous_page is None or previous_page == page:
+        return
+    st.html(
+        """
+        <script>
+        const doc = document;
+        const main = doc.querySelector('[data-testid="stMain"]');
+        if (main) {
+          main.scrollTo({top: 0, left: 0, behavior: 'instant'});
+        } else {
+          window.scrollTo({top: 0, left: 0, behavior: 'instant'});
+        }
+        if (window.innerWidth <= 768) {
+          let didCollapse = false;
+          const collapseSidebar = () => {
+            if (didCollapse) return;
+            const collapse = doc.querySelector(
+              '[data-testid="stSidebarCollapseButton"] button'
+            );
+            if (collapse) {
+              didCollapse = true;
+              collapse.click();
+            }
+          };
+          collapseSidebar();
+          window.setTimeout(collapseSidebar, 100);
+          window.setTimeout(collapseSidebar, 300);
+        }
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
+
+
 def _render_sidebar_navigation() -> str:
     if st.session_state.get("main_tab") not in PAGE_OPTIONS:
         st.session_state["main_tab"] = "Dataset"
@@ -195,7 +236,8 @@ def _render_sidebar_navigation() -> str:
         st.sidebar.markdown("○ Dataset\n\n○ Survival mapping\n\n○ Data quality")
     else:
         file_name = getattr(metadata, "file_name", "Current dataset")
-        st.sidebar.markdown(f"**{escape(str(file_name))}**")
+        st.sidebar.markdown("**Dataset**")
+        st.sidebar.text(str(file_name))
         st.sidebar.caption(f"{len(uploaded_df):,} rows · {len(uploaded_df.columns):,} columns")
         if st.session_state.get("survival_config"):
             mapping_status = "✓ Confirmed"
@@ -218,7 +260,8 @@ def _render_sidebar_navigation() -> str:
             "✓ Dataset loaded  \n"
             f"{mapping_status} survival mapping  \n"
             f"{quality_status} data quality  \n"
-            f"{len(active_filters)} active filter{'s' if len(active_filters) != 1 else ''}"
+            f"{len(active_filters)} active survival "
+            f"filter{'s' if len(active_filters) != 1 else ''}"
         )
 
     st.sidebar.markdown("---")
@@ -237,6 +280,7 @@ def _render_dataset_page() -> None:
     uploaded_file = st.file_uploader(
         "Upload a dataset",
         type=["csv", "tsv", "txt", "xlsx"],
+        key="dataset_upload",
         help="Supported formats: CSV, TSV, TXT, XLSX",
     )
     st.caption("Supported formats: CSV, TSV, TXT, XLSX")
@@ -248,28 +292,85 @@ def _render_dataset_page() -> None:
             "are detected automatically."
         )
         if st.button("Load example dataset"):
-            _load_example_dataset(EXAMPLE_DATASETS[example_label])
+            ignored_digest = (
+                uploaded_file_content_digest(uploaded_file)
+                if uploaded_file is not None
+                else None
+            )
+            _load_example_dataset(
+                EXAMPLE_DATASETS[example_label],
+                ignored_upload_digest=ignored_digest,
+            )
             st.rerun()
 
     if uploaded_file is not None:
         try:
             content_digest = uploaded_file_content_digest(uploaded_file)
-            load_result = read_dataset_with_metadata(uploaded_file)
+            if content_digest == st.session_state.get("ignored_upload_digest"):
+                st.caption(
+                    "The selected upload is paused because an example dataset is active. "
+                    "Choose a different file or click below to use it again."
+                )
+                if st.button("Use selected upload"):
+                    st.session_state.pop("ignored_upload_digest", None)
+                    st.rerun()
+                load_result = None
+            else:
+                encoding_override = _render_text_encoding_override(
+                    uploaded_file.name,
+                    content_digest,
+                )
+                load_result = _cached_dataset_load(
+                    uploaded_file,
+                    content_digest,
+                    encoding_override=encoding_override,
+                )
+                if load_result.metadata.available_sheets:
+                    selected_sheet = st.selectbox(
+                        "Excel worksheet",
+                        list(load_result.metadata.available_sheets),
+                        index=list(load_result.metadata.available_sheets).index(
+                            load_result.metadata.sheet_name
+                        ),
+                        key=f"excel_sheet_{content_digest[:12]}",
+                    )
+                    if selected_sheet != load_result.metadata.sheet_name:
+                        load_result = _cached_dataset_load(
+                            uploaded_file,
+                            content_digest,
+                            encoding_override=encoding_override,
+                            sheet_name=selected_sheet,
+                        )
         except ValueError as exc:
             st.error(str(exc))
-        else:
-            dataset_replaced = _sync_uploaded_dataset_state(
-                uploaded_file.name,
-                load_result.dataframe,
-                content_digest=content_digest,
-            )
-            st.session_state["dataset_metadata"] = load_result.metadata
-            if dataset_replaced:
-                st.info(
-                    "A different dataset was detected. Previous survival mapping, "
-                    "annotations, and analysis selections were reset."
+            if st.session_state.get("uploaded_df") is not None:
+                st.warning(
+                    "The previous dataset remains active; the invalid replacement "
+                    "was not applied."
                 )
-            st.success("Dataset loaded successfully.")
+        else:
+            if load_result is not None:
+                dataset_replaced = _sync_uploaded_dataset_state(
+                    uploaded_file.name,
+                    load_result.dataframe,
+                    content_digest=content_digest,
+                    parser_variant=(
+                        f"encoding={encoding_override or 'auto'};"
+                        f"sheet={load_result.metadata.sheet_name or '<none>'}"
+                    ),
+                )
+                st.session_state["dataset_metadata"] = load_result.metadata
+                st.session_state["dataset_source"] = "upload"
+                st.session_state.pop("loaded_example_dataset", None)
+                if dataset_replaced:
+                    st.info(
+                        "A different dataset was detected. Previous survival mapping, "
+                        "annotations, and analysis selections were reset."
+                    )
+                st.success("Dataset loaded successfully.")
+    elif st.session_state.get("dataset_source") == "upload":
+        _clear_current_dataset()
+        st.info("The uploaded dataset was cleared.")
 
     df = st.session_state.get("uploaded_df")
     profile = st.session_state.get("profile_df")
@@ -320,7 +421,11 @@ def _render_dataset_page() -> None:
     )
 
 
-def _load_example_dataset(file_name: str) -> None:
+def _load_example_dataset(
+    file_name: str,
+    *,
+    ignored_upload_digest: str | None = None,
+) -> None:
     example_path = Path(__file__).resolve().parent / "datasets" / file_name
     content = example_path.read_bytes()
     uploaded = BytesIO(content)
@@ -335,8 +440,80 @@ def _load_example_dataset(file_name: str) -> None:
     st.session_state["analysis_goal"] = ANALYSIS_GOAL_SURVIVAL
     st.session_state["analysis_goal_selector"] = ANALYSIS_GOAL_SURVIVAL
     st.session_state["loaded_example_dataset"] = file_name
+    st.session_state["dataset_source"] = "example"
+    if ignored_upload_digest is not None:
+        st.session_state["ignored_upload_digest"] = ignored_upload_digest
     if file_name == "lung.csv":
         st.session_state["time_unit_time"] = "days"
+
+
+def _render_text_encoding_override(
+    file_name: str,
+    content_digest: str,
+) -> str | None:
+    if Path(file_name).suffix.lower() == ".xlsx":
+        return None
+    options = {
+        "Auto-detect": None,
+        "UTF-8": "utf-8",
+        "UTF-8 with BOM": "utf-8-sig",
+        "UTF-16": "utf-16",
+        "UTF-32": "utf-32",
+        "Windows-1252": "cp1252",
+        "Latin-1": "latin-1",
+        "GB18030 (Chinese)": "gb18030",
+        "Shift-JIS (Japanese)": "shift_jis",
+    }
+    choice = st.selectbox(
+        "Text encoding",
+        list(options),
+        key=f"text_encoding_{content_digest[:12]}",
+        help="Use a manual encoding if names or labels appear garbled.",
+    )
+    return options[choice]
+
+
+def _cached_dataset_load(
+    uploaded_file: Any,
+    content_digest: str,
+    *,
+    encoding_override: str | None = None,
+    sheet_name: str | None = None,
+):
+    cache_key = (
+        content_digest,
+        str(getattr(uploaded_file, "name", "")),
+        encoding_override,
+        sheet_name,
+    )
+    cache = st.session_state.get("dataset_parse_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
+    result = read_dataset_with_metadata(
+        uploaded_file,
+        encoding_override=encoding_override,
+        sheet_name=sheet_name,
+    )
+    cache = dict(cache)
+    cache[cache_key] = result
+    while len(cache) > 4:
+        cache.pop(next(iter(cache)))
+    st.session_state["dataset_parse_cache"] = cache
+    return result
+
+
+def _clear_current_dataset() -> None:
+    _invalidate_dataset_derived_state()
+    for key in [
+        "uploaded_df",
+        "profile_df",
+        "dataset_metadata",
+        "uploaded_dataset_signature",
+        "uploaded_dataset_parser_variant",
+        "dataset_source",
+        "dataset_parse_cache",
+    ]:
+        st.session_state.pop(key, None)
 
 
 def _sync_analysis_goal() -> None:
@@ -422,7 +599,17 @@ def _render_dataset_summary(metadata: DatasetMetadata, df: pd.DataFrame) -> None
         f"**Detected format:** {metadata.format_name}  \n"
         f"**Detected delimiter:** {delimiter}  \n"
         f"**Detected encoding:** {encoding}"
+        + (
+            f"  \n**Worksheet:** {escape(metadata.sheet_name)}"
+            if metadata.sheet_name is not None
+            else ""
+        )
     )
+    if metadata.encoding in {"cp1252", "latin-1"}:
+        st.caption(
+            "A legacy fallback encoding was used. If text looks garbled, choose "
+            "the correct encoding above the preview."
+        )
 
 
 def _render_dataset_preview(df: pd.DataFrame, profile: pd.DataFrame) -> None:
@@ -495,6 +682,7 @@ def _sync_uploaded_dataset_state(
     df: pd.DataFrame,
     *,
     content_digest: str | None = None,
+    parser_variant: str | None = None,
 ) -> bool:
     """Synchronize upload state and report whether an existing dataset was replaced."""
     dataset_signature = dataset_content_signature(
@@ -503,13 +691,20 @@ def _sync_uploaded_dataset_state(
         content_digest=content_digest,
     )
     previous_signature = st.session_state.get("uploaded_dataset_signature")
-    dataset_changed = previous_signature != dataset_signature
+    previous_variant = st.session_state.get("uploaded_dataset_parser_variant")
+    dataset_changed = (
+        previous_signature != dataset_signature
+        or previous_variant != parser_variant
+    )
     dataset_replaced = previous_signature is not None and dataset_changed
 
     if dataset_changed:
         _invalidate_dataset_derived_state()
+    else:
+        return False
 
     st.session_state["uploaded_dataset_signature"] = dataset_signature
+    st.session_state["uploaded_dataset_parser_variant"] = parser_variant
     st.session_state["uploaded_df"] = df.copy(deep=True)
     profile_df = profile_dataframe(df)
     st.session_state["profile_df"] = profile_df
@@ -740,6 +935,10 @@ def _render_survival_quality_section(report: dict[str, Any]) -> None:
             {"Metric": "Missing time values", "Value": survival_quality["time_missing_count"]},
             {"Metric": "Missing event values", "Value": survival_quality["event_missing_count"]},
             {"Metric": "Negative time values", "Value": survival_quality["negative_time_count"]},
+            {
+                "Metric": "Infinite time values",
+                "Value": survival_quality.get("infinite_time_count"),
+            },
             {"Metric": "Zero time values", "Value": survival_quality["zero_time_count"]},
             {
                 "Metric": "Unmapped event values",
@@ -886,7 +1085,7 @@ def _render_cohort_overview_tab() -> None:
         st.dataframe(baseline_table, hide_index=True, width="stretch")
         st.download_button(
             "Download baseline table as CSV",
-            data=baseline_table.to_csv(index=False).encode("utf-8"),
+            data=dataframe_to_safe_csv_bytes(baseline_table),
             file_name="baseline_characteristics.csv",
             mime="text/csv",
         )
@@ -1125,17 +1324,17 @@ def _render_baseline_table_controls(
 
     _sanitize_multiselect_state("cohort_continuous_vars", all_columns)
     _sanitize_multiselect_state("cohort_categorical_vars", all_columns)
+    st.session_state.setdefault("cohort_continuous_vars", continuous_default)
+    st.session_state.setdefault("cohort_categorical_vars", categorical_default)
 
     continuous_vars = st.multiselect(
         "Continuous variables",
         all_columns,
-        default=continuous_default,
         key="cohort_continuous_vars",
     )
     categorical_vars = st.multiselect(
         "Categorical variables",
         all_columns,
-        default=categorical_default,
         key="cohort_categorical_vars",
     )
     if not all_columns:
@@ -1244,7 +1443,7 @@ def _render_charts_tab() -> None:
     chartable_variables = [
         column
         for column, variable_type in variable_types.items()
-        if variable_type in {"numeric", "categorical"}
+        if variable_type in {"numeric", "categorical", "datetime"}
     ]
     if not chartable_variables:
         st.warning("No chartable variables found.")
@@ -1318,18 +1517,23 @@ def _render_charts_tab() -> None:
                 min_value=3,
                 max_value=50,
                 value=20,
+                disabled=axis_controls_disabled,
+                help="Applies to categorical axes and grouping variables.",
             )
         )
         include_missing = bool(
             option_row[1].checkbox(
                 "Include missing values in categorical charts",
                 value=True,
+                disabled=axis_controls_disabled,
             )
         )
         normalize = bool(
             option_row[2].checkbox(
                 "Normalize stacked bar chart to percentages",
                 value=False,
+                disabled=chart_type not in {"auto", "stacked_bar"},
+                help="Only applies to stacked bar charts.",
             )
         )
 
@@ -1384,7 +1588,7 @@ def _render_charts_tab() -> None:
             )
             st.download_button(
                 "Download chart as HTML",
-                data=fig.to_html(include_plotlyjs="cdn"),
+                data=fig.to_html(include_plotlyjs=True),
                 file_name="chart.html",
                 mime="text/html",
             )
@@ -1408,14 +1612,14 @@ def _render_charts_tab() -> None:
         )
         st.download_button(
             "Download chart as HTML",
-            data=fig.to_html(include_plotlyjs="cdn"),
+            data=fig.to_html(include_plotlyjs=True),
             file_name="chart.html",
             mime="text/html",
         )
 
 
 def _default_chart_x_column(variable_types: dict[str, str]) -> str | None:
-    for variable_type in ["numeric", "categorical"]:
+    for variable_type in ["numeric", "categorical", "datetime"]:
         for column, detected_type in variable_types.items():
             if detected_type == variable_type:
                 return column
@@ -1666,8 +1870,9 @@ def _render_survival_analysis_tab() -> None:
         )
         if not pairwise_df.empty:
             st.subheader("Pairwise log-rank tests")
-            st.warning(
-                "Pairwise tests are exploratory and are not adjusted for multiple comparisons in this version."
+            st.caption(
+                "Pairwise tests are exploratory. Holm-adjusted p-values are included "
+                "to control family-wise error across the displayed comparisons."
             )
             st.dataframe(pairwise_df, hide_index=True, width="stretch")
             _render_dataframe_download(
@@ -1767,12 +1972,12 @@ def _render_survival_filters(
         else {}
     )
     _sanitize_multiselect_state("active_survival_filter_columns", filter_columns)
+    st.session_state.setdefault("active_survival_filter_columns", [])
     selections: dict[str, tuple[str, Any]] = {}
     with st.expander("Cohort filters"):
         selected_columns = st.multiselect(
             "Add filter variables",
             filter_columns,
-            default=[],
             key="active_survival_filter_columns",
             help="Only selected variables will show filter controls.",
         )
@@ -1814,19 +2019,26 @@ def _render_survival_filters(
                     selections[column] = ("date", selected)
             else:
                 options = sorted(series.dropna().unique().tolist(), key=str)
+                filter_key = f"survival_filter_{column}"
+                _sanitize_multiselect_state(filter_key, options)
+                st.session_state.setdefault(filter_key, [])
                 selected = st.multiselect(
                     f"Filter by {column}",
                     options,
-                    default=[],
                     help="Leave empty to include all values.",
-                    key=f"survival_filter_{column}",
+                    key=filter_key,
                 )
                 if selected:
                     selections[column] = ("categorical", selected)
 
     st.session_state["active_survival_filters"] = selections
     if selections:
-        st.caption("Active filters: " + ", ".join(selections))
+        st.caption(
+            "Active survival filters: "
+            + ", ".join(selections)
+            + f". Rows retained: {len(_apply_survival_filters(uploaded_df, selections)):,} "
+            f"of {len(uploaded_df):,}."
+        )
     else:
         st.caption("Current cohort: all mapped rows")
     return _apply_survival_filters(uploaded_df, selections)
@@ -1946,10 +2158,12 @@ def _render_survival_group_label_editor(survival_ready_df: pd.DataFrame, group_c
     if "_group" not in survival_ready_df.columns:
         return
 
-    raw_group_values = sorted(
-        [value for value in survival_ready_df["_group"].dropna().unique()],
-        key=lambda value: str(value),
-    )
+    raw_values_by_key = {}
+    for value in survival_ready_df["_group"].dropna():
+        raw_values_by_key.setdefault(_typed_group_key(value), value)
+    raw_group_values = [
+        raw_values_by_key[key] for key in sorted(raw_values_by_key)
+    ]
     if not raw_group_values:
         return
 
@@ -1963,21 +2177,42 @@ def _render_survival_group_label_editor(survival_ready_df: pd.DataFrame, group_c
 
     updated_column_labels = {}
     with st.expander("Group value labels"):
-        for raw_value in raw_group_values:
+        duplicate_displays = {
+            str(value)
+            for value in raw_group_values
+            if sum(str(other) == str(value) for other in raw_group_values) > 1
+        }
+        for index, raw_value in enumerate(raw_group_values):
+            typed_key = _typed_group_key(raw_value)
             raw_key = str(raw_value)
+            raw_display = (
+                f"{raw_key} ({type(raw_value).__name__})"
+                if raw_key in duplicate_displays
+                else raw_key
+            )
             entered_label = st.text_input(
-                f"Raw value: {raw_key}",
-                value=str(existing_column_labels.get(raw_key, "")),
-                key=f"survival_group_label_{group_col}_{raw_key}",
+                f"Raw value: {raw_display}",
+                value=str(
+                    existing_column_labels.get(
+                        typed_key,
+                        existing_column_labels.get(raw_key, ""),
+                    )
+                ),
+                key=f"survival_group_label_{group_col}_{index}",
             )
             if entered_label.strip():
-                updated_column_labels[raw_key] = entered_label.strip()
+                updated_column_labels[typed_key] = entered_label.strip()
 
     if updated_column_labels:
         all_labels[group_col] = updated_column_labels
     else:
         all_labels.pop(group_col, None)
     st.session_state["group_value_labels"] = all_labels
+
+
+def _typed_group_key(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}:{value!r}"
 
 
 def _render_survival_warning_section(warnings: list[str]) -> None:
@@ -2032,7 +2267,7 @@ def _render_dataframe_download(label: str, df: pd.DataFrame, file_name: str) -> 
 
     st.download_button(
         label,
-        data=df.to_csv(index=False).encode("utf-8"),
+        data=dataframe_to_safe_csv_bytes(df),
         file_name=file_name,
         mime="text/csv",
     )
@@ -2062,7 +2297,13 @@ def _parse_timepoints(
     except ValueError:
         return fallback_timepoints, "Could not parse time points; using suggested defaults."
 
-    parsed_timepoints = [timepoint for timepoint in parsed_timepoints if timepoint >= 0]
+    parsed_timepoints = sorted(
+        {
+            round(timepoint, 6)
+            for timepoint in parsed_timepoints
+            if isfinite(timepoint) and timepoint >= 0
+        }
+    )
     if not parsed_timepoints and fallback_timepoints:
         return fallback_timepoints, "No valid non-negative time points were entered; using suggested defaults."
 
@@ -2089,6 +2330,12 @@ def _format_number(value: Any) -> str:
 
 
 def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
+    confirmation_message = st.session_state.pop(
+        "survival_confirmation_message",
+        None,
+    )
+    if confirmation_message:
+        st.success(confirmation_message)
     role_suggestions = suggest_survival_roles(profile)
     all_columns = [str(column) for column in df.columns]
     pending_config = st.session_state.pop("pending_survival_setup_config", None)
@@ -2253,12 +2500,13 @@ def _render_survival_setup(df: pd.DataFrame, profile: pd.DataFrame) -> None:
 
         event_count = int((survival_ready_df["_event"] == 1).sum())
         censored_count = int((survival_ready_df["_event"] == 0).sum())
-        st.success(
+        st.session_state["survival_confirmation_message"] = (
             "Survival mapping confirmed.\n\n"
             f"Usable rows: {len(survival_ready_df)}\n\n"
             f"Events: {event_count}\n\n"
             f"Censored: {censored_count}"
         )
+        st.rerun()
 
     mapping_is_current = st.session_state.get("survival_config") == config
     _render_mapping_validation_summary(
@@ -2551,9 +2799,13 @@ def _render_column_annotations(df: pd.DataFrame, profile: pd.DataFrame) -> None:
 
 
 def _render_export_section(df: pd.DataFrame, profile: pd.DataFrame) -> None:
+    st.warning(
+        "Exports can contain direct identifiers and sensitive clinical data. "
+        "Review access controls and de-identify files before sharing."
+    )
     st.download_button(
         "Download current dataset as CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
+        data=dataframe_to_safe_csv_bytes(df),
         file_name="current_dataset.csv",
         mime="text/csv",
     )
@@ -2618,11 +2870,16 @@ def _render_export_section(df: pd.DataFrame, profile: pd.DataFrame) -> None:
     ready_df = create_survival_ready_dataframe(df, config)
     cleaned_df = create_cleaned_mapped_dataframe(df, config)
     config_bytes = serialize_analysis_configuration(config, annotations)
+    excluded_rows = len(df) - len(cleaned_df)
+    st.caption(
+        f"Cleaned mapped export includes {len(cleaned_df):,} of {len(df):,} rows; "
+        f"{excluded_rows:,} row(s) were excluded by the confirmed time/event mapping."
+    )
 
     data_column, config_column = st.columns(2)
     data_column.download_button(
         "Download cleaned mapped data as CSV",
-        data=cleaned_df.to_csv(index=False).encode("utf-8"),
+        data=dataframe_to_safe_csv_bytes(cleaned_df),
         file_name="cleaned_mapped_data.csv",
         mime="text/csv",
     )
@@ -2819,23 +3076,27 @@ def _render_event_value_mapping(
     st.caption(", ".join(_format_value(value) for value in unique_values))
 
     default_event_values = _default_event_values(unique_values)
+    event_key = f"event_values_{event_col}"
+    _sanitize_multiselect_state(event_key, unique_values)
+    st.session_state.setdefault(event_key, default_event_values)
     event_values = st.multiselect(
         "Which value(s) mean the event occurred?",
         unique_values,
-        default=default_event_values,
         format_func=_format_value,
-        key=f"event_values_{event_col}",
+        key=event_key,
     )
     default_censor_values = _default_censor_values(
         unique_values,
         event_values,
     )
+    censor_key = f"censor_values_{event_col}"
+    _sanitize_multiselect_state(censor_key, unique_values)
+    st.session_state.setdefault(censor_key, default_censor_values)
     censor_values = st.multiselect(
         "Which value(s) explicitly mean censored?",
         unique_values,
-        default=default_censor_values,
         format_func=_format_value,
-        key=f"censor_values_{event_col}",
+        key=censor_key,
     )
 
     mapped_keys = {
@@ -2892,7 +3153,7 @@ def _render_event_value_mapping(
 
 
 def _render_time_unit_selector(time_col: str) -> str:
-    options = ["days", "months", "years", "unknown"]
+    options = ["days", "weeks", "months", "years", "unknown"]
     suggested_unit = (
         "days"
         if st.session_state.get("loaded_example_dataset") == "lung.csv"
@@ -2927,12 +3188,14 @@ def _default_event_values(unique_values: list[Any]) -> list[Any]:
     numeric_values = pd.to_numeric(pd.Series(unique_values), errors="coerce")
     if len(unique_values) == 2 and numeric_values.notna().all():
         numeric_set = set(numeric_values.astype(float))
-        target_value = 1.0 if numeric_set == {0.0, 1.0} else float(numeric_values.max())
-
-        for value in unique_values:
-            parsed_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-            if parsed_value == target_value:
-                return [value]
+        if numeric_set == {0.0, 1.0}:
+            for value in unique_values:
+                parsed_value = pd.to_numeric(
+                    pd.Series([value]),
+                    errors="coerce",
+                ).iloc[0]
+                if parsed_value == 1.0:
+                    return [value]
 
     event_markers = {
         "true",
@@ -3007,6 +3270,9 @@ def _suggest_time_unit(time_col: str) -> str:
 
     if any(keyword in normalized for keyword in ["days", "day"]):
         return "days"
+
+    if any(keyword in normalized for keyword in ["weeks", "week", "wk"]):
+        return "weeks"
 
     if any(keyword in normalized for keyword in ["months", "month", "os_months"]):
         return "months"

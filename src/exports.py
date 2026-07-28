@@ -1,10 +1,13 @@
 from dataclasses import asdict, fields
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from html import escape
 from io import BytesIO
 import json
+import math
+from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
 import pandas as pd
 
 from src.column_annotations import ColumnAnnotation, USE_KEYS
@@ -14,6 +17,9 @@ from src.survival_mapping import SurvivalConfig
 
 CONFIG_VERSION = 1
 MAX_CONFIG_BYTES = 1_000_000
+ALLOWED_TIME_UNITS = {"unknown", "days", "weeks", "months", "years"}
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
+PDF_CELL_LIMIT = 600
 
 
 def serialize_analysis_configuration(
@@ -32,7 +38,26 @@ def serialize_analysis_configuration(
             for column, annotation in annotations.items()
         },
     }
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def dataframe_to_safe_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Serialize a table while neutralizing spreadsheet formula execution."""
+    safe = df.copy()
+    safe.columns = [_safe_spreadsheet_text(str(column)) for column in safe.columns]
+    object_columns = safe.select_dtypes(include=["object", "string"]).columns
+    for column in object_columns:
+        safe[column] = safe[column].map(
+            lambda value: (
+                _safe_spreadsheet_text(value) if isinstance(value, str) else value
+            )
+        )
+    return safe.to_csv(index=False).encode("utf-8")
 
 
 def deserialize_analysis_configuration(
@@ -42,7 +67,10 @@ def deserialize_analysis_configuration(
     if len(raw) > MAX_CONFIG_BYTES:
         raise ValueError("Configuration file is too large.")
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json.loads(
+            raw.decode("utf-8-sig"),
+            parse_constant=lambda value: (_raise_invalid_json_number(value)),
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Configuration must be valid UTF-8 JSON.") from exc
     if not isinstance(payload, dict) or payload.get("version") != CONFIG_VERSION:
@@ -62,6 +90,32 @@ def deserialize_analysis_configuration(
         mapping["censor_values"], list
     ):
         raise ValueError("Event and censor values must be JSON arrays.")
+    optional_columns = {
+        "time_col",
+        "event_col",
+        "id_col",
+        "group_col",
+        "start_date_col",
+        "event_date_col",
+        "last_followup_date_col",
+    }
+    for field_name in optional_columns:
+        value = mapping.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"Mapping field '{field_name}' must be text or null.")
+    for field_name in ("event_values", "censor_values"):
+        if any(isinstance(value, (dict, list)) for value in mapping[field_name]):
+            raise ValueError(f"Mapping field '{field_name}' must contain scalar values.")
+    if not isinstance(mapping.get("time_unit", "unknown"), str):
+        raise ValueError("Mapping field 'time_unit' must be text.")
+    if mapping.get("time_unit", "unknown") not in ALLOWED_TIME_UNITS:
+        raise ValueError("Unsupported time unit in configuration.")
+    if not isinstance(mapping.get("time_source", "duration"), str):
+        raise ValueError("Mapping field 'time_source' must be text.")
+    if not isinstance(mapping.get("missing_event_handling", "exclude"), str):
+        raise ValueError("Mapping field 'missing_event_handling' must be text.")
+    if not isinstance(mapping.get("unmapped_event_handling", "exclude"), str):
+        raise ValueError("Mapping field 'unmapped_event_handling' must be text.")
     config = SurvivalConfig(**mapping)
 
     raw_annotations = payload.get("annotations")
@@ -135,13 +189,10 @@ def build_pdf_report(
         TableStyle,
     )
 
-    font_name, bold_font_name = "Helvetica", "Helvetica-Bold"
-    try:
-        pdfmetrics.registerFont(TTFont("ReportFont", "Vera.ttf"))
-        pdfmetrics.registerFont(TTFont("ReportFontBold", "VeraBd.ttf"))
-        font_name, bold_font_name = "ReportFont", "ReportFontBold"
-    except Exception:
-        pass
+    font_name, bold_font_name = _register_unicode_pdf_fonts(
+        pdfmetrics,
+        TTFont,
+    )
 
     buffer = BytesIO()
     document = SimpleDocTemplate(
@@ -301,7 +352,14 @@ def _display_value(value: Any) -> str:
 
 
 def _pdf_text(value: Any) -> str:
-    return escape(_display_value(value)).replace("\n", "<br/>")
+    text = _display_value(value)
+    if len(text) > PDF_CELL_LIMIT:
+        text = text[: PDF_CELL_LIMIT - 1] + "…"
+    escaped = escape(text).replace("\n", "<br/>")
+    return "&#8203;".join(
+        escaped[index : index + 40]
+        for index in range(0, len(escaped), 40)
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -309,8 +367,54 @@ def _json_safe(value: Any) -> Any:
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(item) for item in value]
-    if value is None or pd.isna(value):
+    if value is None or (not isinstance(value, (dict, list, tuple, set)) and pd.isna(value)):
+        return None
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (float, np.floating)) and not math.isfinite(float(value)):
         return None
     if hasattr(value, "item"):
-        return value.item()
+        return _json_safe(value.item())
     return value
+
+
+def _safe_spreadsheet_text(value: str) -> str:
+    if value.lstrip(" \ufeff").startswith(FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+def _raise_invalid_json_number(value: str) -> None:
+    raise ValueError(f"Configuration contains invalid JSON number '{value}'.")
+
+
+def _register_unicode_pdf_fonts(pdfmetrics: Any, tt_font: Any) -> tuple[str, str]:
+    candidates = [
+        (
+            Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+            Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        ),
+        (
+            Path("/Library/Fonts/Arial Unicode.ttf"),
+            Path("/Library/Fonts/Arial Unicode.ttf"),
+        ),
+        (
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ),
+    ]
+    for regular_path, bold_path in candidates:
+        if not regular_path.exists() or not bold_path.exists():
+            continue
+        try:
+            pdfmetrics.registerFont(tt_font("ReportFont", str(regular_path)))
+            pdfmetrics.registerFont(tt_font("ReportFontBold", str(bold_path)))
+            return "ReportFont", "ReportFontBold"
+        except Exception:
+            continue
+    try:
+        pdfmetrics.registerFont(tt_font("ReportFont", "Vera.ttf"))
+        pdfmetrics.registerFont(tt_font("ReportFontBold", "VeraBd.ttf"))
+        return "ReportFont", "ReportFontBold"
+    except Exception:
+        return "Helvetica", "Helvetica-Bold"

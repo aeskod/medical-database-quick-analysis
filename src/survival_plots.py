@@ -23,13 +23,31 @@ def plot_km_curve(
         if show_ci:
             fig.add_trace(
                 go.Scatter(
-                    x=ordered_group_df["time"].tolist()
-                    + ordered_group_df["time"].iloc[::-1].tolist(),
-                    y=ordered_group_df["ci_upper"].tolist()
-                    + ordered_group_df["ci_lower"].iloc[::-1].tolist(),
-                    fill="toself",
+                    x=ordered_group_df["time"],
+                    y=ordered_group_df["ci_lower"],
+                    mode="lines",
+                    line={
+                        "color": "rgba(255,255,255,0)",
+                        "shape": "hv",
+                        "width": 0,
+                    },
+                    hoverinfo="skip",
+                    name=f"{group} CI",
+                    showlegend=False,
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=ordered_group_df["time"],
+                    y=ordered_group_df["ci_upper"],
+                    mode="lines",
+                    fill="tonexty",
                     fillcolor=_hex_to_rgba(color, 0.18),
-                    line={"color": "rgba(255,255,255,0)"},
+                    line={
+                        "color": "rgba(255,255,255,0)",
+                        "shape": "hv",
+                        "width": 0,
+                    },
                     hoverinfo="skip",
                     name=f"{group} CI",
                     showlegend=False,

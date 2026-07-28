@@ -193,10 +193,10 @@ def test_summarize_categorical_variable_collapses_rare_levels_and_adds_missing_r
 
     summary = summarize_categorical_variable(df, "stage", max_levels=2, include_missing=True)
 
-    assert summary["level"].tolist() == ["III", "I", "Other", "Missing"]
+    assert summary["level"].tolist() == ["III", "I", "Other (collapsed)", "Missing"]
     assert summary["count"].tolist() == [2, 1, 2, 1]
-    assert summary["percent"].tolist() == [40.0, 20.0, 40.0, 16.67]
-    assert summary["summary"].tolist() == ["2 (40.00%)", "1 (20.00%)", "2 (40.00%)", "1 (16.67%)"]
+    assert summary["percent"].tolist() == [33.33, 16.67, 33.33, 16.67]
+    assert summary["summary"].tolist() == ["2 (33.33%)", "1 (16.67%)", "2 (33.33%)", "1 (16.67%)"]
 
 
 def test_grouped_summaries_exclude_missing_group_values():
@@ -273,7 +273,7 @@ def test_build_baseline_table_does_not_repeat_grouping_variable():
     assert table["Variable"].tolist() == [
         "n",
         "Events, n (%)",
-        "Follow-up, median [IQR]",
+        "Observed duration, median [IQR]",
         "age",
     ]
     assert table.columns.tolist() == ["Variable", "Overall", "F", "M"]
@@ -306,7 +306,7 @@ def test_build_baseline_table_starts_with_patient_event_and_followup_rows():
     assert table["Variable"].tolist() == [
         "n",
         "Events, n (%)",
-        "Follow-up, median [IQR]",
+        "Observed duration, median [IQR]",
     ]
     assert table.loc[table["Variable"] == "n"].iloc[0].to_dict() == {
         "Variable": "n",
@@ -316,4 +316,97 @@ def test_build_baseline_table_starts_with_patient_event_and_followup_rows():
     }
     assert table.loc[table["Variable"] == "Events, n (%)", "Overall"].iloc[0] == "2 (50.00%)"
     assert table.loc[table["Variable"] == "Events, n (%)", "A"].iloc[0] == "1 (50.00%)"
-    assert table.loc[table["Variable"] == "Follow-up, median [IQR]", "B"].iloc[0] == "35 [32.50, 37.50]"
+    assert table.loc[table["Variable"] == "Observed duration, median [IQR]", "B"].iloc[0] == "35 [32.50, 37.50]"
+
+
+def test_real_other_level_is_not_overwritten_by_collapsed_levels():
+    df = pd.DataFrame(
+        {"stage": ["Other", "Other", "A", "B", "C", "D"]}
+    )
+
+    summary = summarize_categorical_variable(
+        df,
+        "stage",
+        max_levels=2,
+        include_missing=False,
+    )
+
+    assert "Other" in summary["level"].tolist()
+    assert "Other (collapsed)" in summary["level"].tolist()
+    assert int(summary["count"].sum()) == 6
+
+
+def test_table1_uses_global_category_collapse_for_every_group():
+    df = pd.DataFrame(
+        {
+            "arm": ["A"] * 6 + ["B"] * 6,
+            "stage": ["I", "I", "I", "II", "III", "IV"]
+            + ["I", "II", "II", "II", "V", "VI"],
+        }
+    )
+
+    table = build_baseline_table(
+        df,
+        continuous_vars=[],
+        categorical_vars=["stage"],
+        group_col="arm",
+        max_levels=2,
+        include_missing=False,
+    )
+
+    assert set(table["Variable"]) >= {
+        "stage = I",
+        "stage = II",
+        "stage = Other (collapsed)",
+    }
+    collapsed = table.loc[
+        table["Variable"] == "stage = Other (collapsed)"
+    ].iloc[0]
+    assert collapsed["A"] == "2 (33.33%)"
+    assert collapsed["B"] == "2 (33.33%)"
+
+
+def test_table1_uses_one_record_per_patient_for_all_baseline_statistics():
+    df = pd.DataFrame(
+        {
+            "patient_id": ["P1", "P1", "P1", "P2"],
+            "age": [50, 50, 50, 80],
+            "arm": ["A", "A", "A", "B"],
+        }
+    )
+
+    table = build_baseline_table(
+        df,
+        continuous_vars=["age"],
+        categorical_vars=[],
+        group_col="arm",
+        id_col="patient_id",
+    )
+
+    assert table.loc[table["Variable"] == "n", "Overall"].iloc[0] == "2"
+    assert table.loc[table["Variable"] == "age", "Overall"].iloc[0].startswith(
+        "65 +/-"
+    )
+
+
+def test_mixed_group_values_and_duplicate_custom_labels_get_distinct_columns():
+    df = pd.DataFrame(
+        {
+            "arm": [1, 1, "1", "1"],
+            "age": [50, 60, 70, 80],
+        }
+    )
+
+    table = build_baseline_table(
+        df,
+        continuous_vars=["age"],
+        categorical_vars=[],
+        group_col="arm",
+        group_value_labels={"1": "Same"},
+    )
+
+    group_columns = [
+        column for column in table.columns if column not in {"Variable", "Overall"}
+    ]
+    assert len(group_columns) == 2
+    assert len(set(group_columns)) == 2

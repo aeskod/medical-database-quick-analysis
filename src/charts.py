@@ -4,6 +4,7 @@ from typing import Any
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from src.profiling import normalize_missing_values, profile_dataframe
 
@@ -15,6 +16,7 @@ CHART_TYPE_OPTIONS = {
     "Box plot": "box",
     "Violin plot": "violin",
     "Scatter plot": "scatter",
+    "Time series": "line",
     "Stacked bar chart": "stacked_bar",
     "Correlation heatmap": "correlation_heatmap",
     "Missingness bar chart": "missingness_bar",
@@ -66,6 +68,9 @@ CONTINUOUS_NAME_HINTS = {
     "lab",
     "level",
     "score",
+    "amount",
+    "measure",
+    "measurement",
     "dose",
     "count",
 }
@@ -103,7 +108,11 @@ def get_chart_variable_type(
         return "categorical"
 
     if numeric_parse_rate >= 0.95 and not is_binary_like:
-        if unique_count > 10 or _has_continuous_name_hint(column_name):
+        if (
+            detected_type == "float"
+            or unique_count > 10
+            or _has_continuous_name_hint(column_name)
+        ):
             return "numeric"
 
     if is_binary_like or detected_type in {"boolean", "categorical"} or 2 <= unique_count <= 30:
@@ -152,6 +161,9 @@ def recommend_chart_type(
     if x_type == "numeric" and y_type == "numeric":
         return "scatter"
 
+    if x_type == "datetime" and y_type == "numeric":
+        return "line"
+
     if x_type == "categorical" and y_type == "categorical":
         return "stacked_bar"
 
@@ -185,6 +197,8 @@ def explain_chart_recommendation(
         return f"{x_col} is {x_type} and {y_col} is {y_type}, so a box plot is recommended."
     if resolved_chart_type == "scatter" and y_col is not None:
         return f"{x_col} and {y_col} are both numeric, so a scatter plot is recommended."
+    if resolved_chart_type == "line" and y_col is not None:
+        return f"{x_col} is datetime and {y_col} is numeric, so a time-series line chart is recommended."
     if resolved_chart_type == "stacked_bar" and y_col is not None:
         return f"{x_col} and {y_col} are both categorical, so a stacked bar chart is recommended."
 
@@ -250,7 +264,13 @@ def prepare_categorical_series(
 ) -> pd.Series:
     normalized = normalize_missing_values(df[[column]])[column]
     if include_missing:
-        prepared = normalized.fillna(MISSING_LABEL).astype(str)
+        non_missing_labels = set(normalized.dropna().astype(str))
+        missing_label = (
+            "Missing (missing value)"
+            if MISSING_LABEL in non_missing_labels
+            else MISSING_LABEL
+        )
+        prepared = normalized.fillna(missing_label).astype(str)
     else:
         prepared = normalized.dropna().astype(str)
 
@@ -262,7 +282,12 @@ def prepare_categorical_series(
         return prepared
 
     top_levels = set(value_counts.iloc[:max_levels].index.astype(str))
-    return prepared.where(prepared.isin(top_levels), OTHER_LABEL)
+    if OTHER_LABEL in set(prepared.astype(str)):
+        top_levels.add(OTHER_LABEL)
+    collapsed_label = (
+        "Other (collapsed)" if OTHER_LABEL in set(prepared.astype(str)) else OTHER_LABEL
+    )
+    return prepared.where(prepared.isin(top_levels), collapsed_label)
 
 
 def build_chart_dataframe(
@@ -334,14 +359,55 @@ def plot_histogram(
         max_levels=max_levels,
         include_missing=include_missing,
     )
-    fig = px.histogram(
-        plot_df,
-        x=x_col,
-        color=color_col if color_col in plot_df.columns else None,
-        nbins=nbins,
-        marginal="box",
-        title=title or f"Distribution of {x_col}",
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.2, 0.8],
+        vertical_spacing=0.04,
     )
+    if color_col and color_col in plot_df.columns:
+        groups = list(plot_df.groupby(color_col, sort=False, dropna=False))
+    else:
+        groups = [(None, plot_df)]
+    for group_value, group_df in groups:
+        name = str(group_value) if group_value is not None else str(x_col)
+        legend_group = name
+        fig.add_trace(
+            go.Box(
+                x=group_df[x_col],
+                name=name,
+                legendgroup=legend_group,
+                showlegend=False,
+                boxpoints=False,
+                orientation="h",
+                hovertemplate=f"{x_col}: %{{x}}<extra>{name}</extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Histogram(
+                x=group_df[x_col],
+                name=name,
+                legendgroup=legend_group,
+                showlegend=color_col is not None,
+                nbinsx=nbins,
+                opacity=0.72 if color_col is not None else 1.0,
+                hovertemplate="Range: %{x}<br>Count: %{y}<extra>"
+                + name
+                + "</extra>",
+            ),
+            row=2,
+            col=1,
+        )
+    fig.update_layout(
+        title=title or f"Distribution of {x_col}",
+        barmode="overlay" if color_col is not None else "relative",
+    )
+    fig.update_xaxes(title_text=x_col, row=2, col=1)
+    fig.update_yaxes(showticklabels=False, title_text="", row=1, col=1)
+    fig.update_yaxes(title_text="Count", row=2, col=1)
     _style_figure(fig)
     return fig
 
@@ -521,6 +587,48 @@ def plot_scatter(
     return fig
 
 
+def plot_time_series(
+    df: pd.DataFrame,
+    date_col: str,
+    numeric_col: str,
+    color_col: str | None = None,
+    title: str | None = None,
+    max_levels: int = 20,
+    include_missing: bool = True,
+) -> go.Figure:
+    columns = list(
+        dict.fromkeys(
+            [date_col, numeric_col] + ([color_col] if color_col else [])
+        )
+    )
+    plot_df = normalize_missing_values(df[columns])
+    plot_df[date_col] = pd.to_datetime(
+        plot_df[date_col],
+        errors="coerce",
+        format="mixed",
+    )
+    plot_df[numeric_col] = pd.to_numeric(plot_df[numeric_col], errors="coerce")
+    plot_df = plot_df.dropna(subset=[date_col, numeric_col])
+    if color_col and color_col not in {date_col, numeric_col}:
+        plot_df[color_col] = prepare_categorical_series(
+            plot_df,
+            color_col,
+            max_levels=max_levels,
+            include_missing=include_missing,
+        )
+    plot_df = plot_df.sort_values(date_col, kind="stable")
+    fig = px.line(
+        plot_df,
+        x=date_col,
+        y=numeric_col,
+        color=color_col if color_col in plot_df.columns else None,
+        markers=True,
+        title=title or f"{numeric_col} over time",
+    )
+    _style_figure(fig)
+    return fig
+
+
 def plot_stacked_bar(
     df: pd.DataFrame,
     x_col: str,
@@ -588,9 +696,20 @@ def plot_correlation_heatmap(
             for column in selected_columns
         }
     ).dropna(axis=1, how="all")
+    numeric_df = numeric_df.loc[
+        :,
+        [
+            column
+            for column in numeric_df.columns
+            if numeric_df[column].nunique(dropna=True) > 1
+        ],
+    ]
 
     if len(numeric_df.columns) < 2:
-        raise ValueError("Correlation heatmap requires at least two numeric variables.")
+        raise ValueError(
+            "Correlation heatmap requires at least two numeric variables "
+            "with non-constant values."
+        )
 
     corr = numeric_df.corr(method=method)
     fig = go.Figure(
@@ -671,6 +790,16 @@ def plot_missingness_heatmap(
         height=max(320, min(900, 120 + 24 * len(missing.columns))),
     )
     _style_figure(fig)
+    if len(df) > max_rows:
+        fig.add_annotation(
+            text=f"Showing first {max_rows:,} of {len(df):,} rows",
+            xref="paper",
+            yref="paper",
+            x=1,
+            y=1.08,
+            showarrow=False,
+            font={"size": 11, "color": "#5f6b7a"},
+        )
     return fig
 
 
@@ -691,6 +820,17 @@ def build_chart(
         if chart_type == "auto"
         else chart_type
     )
+    effective_color_col = color_col
+    if (
+        color_col is not None
+        and color_col in df.columns
+        and resolved_chart_type not in {"scatter"}
+        and get_chart_variable_type(color_col, df, profile_df) == "numeric"
+    ):
+        warnings.append(
+            "Numeric color is only supported for scatter plots and was ignored."
+        )
+        effective_color_col = None
 
     try:
         if resolved_chart_type == "missingness_bar":
@@ -722,7 +862,7 @@ def build_chart(
             fig = plot_histogram(
                 df,
                 x_col,
-                color_col=color_col,
+                color_col=effective_color_col,
                 max_levels=max_category_levels,
                 include_missing=include_missing,
             )
@@ -734,7 +874,7 @@ def build_chart(
             fig = plot_bar_chart(
                 df,
                 x_col,
-                color_col=color_col,
+                color_col=effective_color_col,
                 max_levels=max_category_levels,
                 include_missing=include_missing,
             )
@@ -748,7 +888,7 @@ def build_chart(
                 df,
                 numeric_col=numeric_col,
                 category_col=category_col,
-                color_col=color_col,
+                color_col=effective_color_col,
                 max_levels=max_category_levels,
                 include_missing=include_missing,
             )
@@ -769,7 +909,7 @@ def build_chart(
                 df,
                 numeric_col=numeric_col,
                 category_col=category_col,
-                color_col=color_col,
+                color_col=effective_color_col,
                 max_levels=max_category_levels,
                 include_missing=include_missing,
             )
@@ -787,7 +927,31 @@ def build_chart(
                 df,
                 x_col,
                 y_col,
-                color_col=color_col,
+                color_col=effective_color_col,
+                max_levels=max_category_levels,
+                include_missing=include_missing,
+            )
+
+        elif resolved_chart_type == "line":
+            if (
+                x_col is None
+                or y_col is None
+                or get_chart_variable_type(x_col, df, profile_df) != "datetime"
+                or get_chart_variable_type(y_col, df, profile_df) != "numeric"
+            ):
+                warnings.append(
+                    "Time series requires a datetime X variable and numeric Y variable."
+                )
+                return {
+                    "fig": None,
+                    "chart_type": resolved_chart_type,
+                    "warnings": warnings,
+                }
+            fig = plot_time_series(
+                df,
+                x_col,
+                y_col,
+                color_col=effective_color_col,
                 max_levels=max_category_levels,
                 include_missing=include_missing,
             )

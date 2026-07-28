@@ -68,6 +68,9 @@ def infer_column_type(series: pd.Series) -> str:
     lower_values = stripped_values.str.lower()
     column_name = str(series.name or "").lower()
 
+    if pd.api.types.is_datetime64_any_dtype(non_missing.dtype):
+        return "date"
+
     has_id_hint = _has_id_name_hint(column_name)
     mostly_unique = unique_ratio >= 0.95 and non_missing_count > 10
 
@@ -99,10 +102,11 @@ def infer_column_type(series: pd.Series) -> str:
             return "integer"
         return "float"
 
-    date_values = pd.to_datetime(non_missing, errors="coerce", format="mixed")
-    date_parse_ratio = float(date_values.notna().sum()) / non_missing_count
-    if date_parse_ratio >= 0.8:
-        return "date"
+    if numeric_parse_count / non_missing_count < 0.5 and _looks_date_like(non_missing):
+        date_values = pd.to_datetime(non_missing, errors="coerce", format="mixed")
+        date_parse_ratio = float(date_values.notna().sum()) / non_missing_count
+        if date_parse_ratio >= 0.8:
+            return "date"
 
     if 0 < numeric_parse_count < non_missing_count:
         return "mixed"
@@ -138,10 +142,19 @@ def profile_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         unique_count = int(non_missing.nunique(dropna=True))
         unique_ratio = unique_count / non_missing_count if non_missing_count else 0
         missing_percent = round((missing_count / row_count * 100) if row_count else 0.0, 2)
-        numeric_values = pd.to_numeric(non_missing, errors="coerce")
+        is_datetime = pd.api.types.is_datetime64_any_dtype(non_missing.dtype)
+        numeric_values = (
+            pd.Series(np.nan, index=non_missing.index, dtype=float)
+            if is_datetime
+            else pd.to_numeric(non_missing, errors="coerce")
+        )
         numeric_parse_count = int(numeric_values.notna().sum())
         numeric_parse_rate = numeric_parse_count / non_missing_count if non_missing_count else 0
-        date_values = pd.to_datetime(non_missing, errors="coerce", format="mixed")
+        date_values = (
+            pd.to_datetime(non_missing, errors="coerce")
+            if is_datetime or _looks_date_like(non_missing)
+            else pd.Series(pd.NaT, index=non_missing.index)
+        )
         date_parse_count = int(date_values.notna().sum())
         date_parse_rate = date_parse_count / non_missing_count if non_missing_count else 0
         numeric_like = numeric_parse_rate >= 0.8 and numeric_parse_count > 0
@@ -238,7 +251,23 @@ def _all_numeric_values_are_integer(values: pd.Series) -> bool:
 def _has_id_name_hint(column_name: str) -> bool:
     tokens = re.split(r"[^a-z0-9]+", column_name)
     token_set = {token for token in tokens if token}
-    return any(hint in token_set or hint in column_name for hint in ID_NAME_HINTS)
+    return any(
+        hint in token_set
+        or set(hint.split("_")).issubset(token_set)
+        for hint in ID_NAME_HINTS
+    )
+
+
+def _looks_date_like(values: Iterable[object]) -> bool:
+    sample = [str(value).strip() for value in list(values)[:100]]
+    if not sample:
+        return False
+    date_pattern = re.compile(
+        r"(?:^\d{4}[-/.]\d{1,2}[-/.]\d{1,2})"
+        r"|(?:^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})"
+        r"|(?:[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})"
+    )
+    return sum(bool(date_pattern.search(value)) for value in sample) / len(sample) >= 0.8
 
 
 def _values_look_identifier_like(values: Iterable[object]) -> bool:

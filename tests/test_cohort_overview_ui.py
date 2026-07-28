@@ -65,7 +65,7 @@ def test_cohort_overview_renders_patient_aware_cards_characteristics_and_table_o
     metrics = {metric.label: metric.value for metric in app_test.metric}
     assert metrics["Total patients"] == "3"
     assert metrics["Rows"] == "4"
-    assert metrics["Median age"] == "55"
+    assert metrics["Median age"] == "60"
     assert "Key cohort characteristics" in [item.value for item in app_test.subheader]
     assert {item.label for item in app_test.expander}.issuperset(
         {
@@ -84,7 +84,7 @@ def test_cohort_overview_renders_patient_aware_cards_characteristics_and_table_o
     assert baseline_table["Variable"].head(3).tolist() == [
         "n",
         "Events, n (%)",
-        "Follow-up, median [IQR]",
+        "Observed duration, median [IQR]",
     ]
     assert baseline_table.columns.tolist() == ["Variable", "Overall", "Control", "Drug"]
     assert baseline_table.loc[baseline_table["Variable"] == "n", "Drug"].iloc[0] == "2"

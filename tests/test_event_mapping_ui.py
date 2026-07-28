@@ -1,7 +1,7 @@
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
-from app import _default_censor_values
+from app import _default_censor_values, _default_event_values, _suggest_time_unit
 
 
 def event_mapping_harness(df):
@@ -31,6 +31,16 @@ def test_ambiguous_values_are_not_guessed_as_censored():
         ["Complete", "Pending", "Unknown"],
         [],
     ) == []
+
+
+def test_nonstandard_numeric_binary_values_are_not_guessed_as_events():
+    assert _default_event_values([1, 2]) == []
+    assert _default_event_values([0, 1]) == [1]
+
+
+def test_week_time_unit_is_detected():
+    assert _suggest_time_unit("week") == "weeks"
+    assert _suggest_time_unit("followup_wk") == "weeks"
 
 
 def test_event_mapping_ui_defaults_to_explicit_alive_and_excludes_unknown():

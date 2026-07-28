@@ -2,6 +2,7 @@ from dataclasses import dataclass, field, replace
 import re
 from typing import Any, Mapping, Optional
 
+import numpy as np
 import pandas as pd
 
 from src.profiling import normalize_missing_values
@@ -411,6 +412,7 @@ def compute_date_quality(
     for label, earlier_col, later_col in [
         ("Event date before diagnosis/start date", start_col, event_col),
         ("Last follow-up before start date", start_col, followup_col),
+        ("Event date after last follow-up date", event_col, followup_col),
     ]:
         if not earlier_col or not later_col:
             continue
@@ -551,6 +553,7 @@ def compute_survival_quality(
         "event_missing_count": None,
         "time_non_numeric_count": None,
         "negative_time_count": None,
+        "infinite_time_count": None,
         "zero_time_count": None,
         "unmapped_event_value_count": None,
         "unmapped_event_values": [],
@@ -626,11 +629,13 @@ def compute_survival_quality(
         time_missing_mask = time_series.isna()
         time_non_numeric_mask = time_series.notna() & parsed_time.isna()
         negative_time_mask = parsed_time < 0
+        infinite_time_mask = parsed_time.notna() & ~np.isfinite(parsed_time)
         zero_time_mask = parsed_time == 0
 
         result["time_missing_count"] = int(time_missing_mask.sum())
         result["time_non_numeric_count"] = int(time_non_numeric_mask.sum())
         result["negative_time_count"] = int(negative_time_mask.sum())
+        result["infinite_time_count"] = int(infinite_time_mask.sum())
         result["zero_time_count"] = int(zero_time_mask.sum())
 
         if result["time_missing_count"] > 0:
@@ -666,6 +671,17 @@ def compute_survival_quality(
                 )
             )
 
+        if result["infinite_time_count"] > 0:
+            issues.append(
+                QualityIssue(
+                    severity="error",
+                    category="survival_time",
+                    message="Survival time column contains infinite values.",
+                    affected_columns=[time_col],
+                    affected_rows_count=result["infinite_time_count"],
+                )
+            )
+
         if result["zero_time_count"] > 0:
             issues.append(
                 QualityIssue(
@@ -680,6 +696,7 @@ def compute_survival_quality(
         exclusion_masks["missing time"] = time_missing_mask
         exclusion_masks["non-numeric time"] = time_non_numeric_mask
         exclusion_masks["negative time"] = negative_time_mask.fillna(False)
+        exclusion_masks["infinite time"] = infinite_time_mask.fillna(False)
 
     if event_col in normalized_df.columns:
         event_series = normalized_df[event_col]
@@ -806,13 +823,35 @@ def compute_group_quality(
         ]
 
     rows = []
-    for group_value, subset in group_df.groupby("_group", sort=True, dropna=True):
+    typed_keys = group_df["_group"].map(
+        lambda value: (
+            f"{type(value).__module__}.{type(value).__qualname__}:{value!r}"
+        )
+    )
+    group_entries = []
+    for key in sorted(typed_keys.unique()):
+        subset = group_df.loc[typed_keys.eq(key)]
+        group_entries.append((subset["_group"].iloc[0], subset))
+    duplicate_displays = {
+        str(group_value)
+        for group_value, _ in group_entries
+        if sum(
+            str(other_value) == str(group_value)
+            for other_value, _ in group_entries
+        )
+        > 1
+    }
+    for group_value, subset in group_entries:
         n = len(subset)
         events = int((subset["_event"] == 1).sum())
         censored = int((subset["_event"] == 0).sum())
         rows.append(
             {
-                "group": str(group_value),
+                "group": (
+                    f"{group_value} ({type(group_value).__name__})"
+                    if str(group_value) in duplicate_displays
+                    else str(group_value)
+                ),
                 "n": n,
                 "events": events,
                 "censored": censored,
