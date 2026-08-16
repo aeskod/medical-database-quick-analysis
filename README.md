@@ -398,5 +398,6 @@ Open [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 ## License
 
-This repository does not currently grant a software license.
-The author retains all rights unless a license is added later.
+This project is available under the [MIT License](LICENSE).
+You may use, copy, modify, merge, publish, distribute, sublicense, and sell
+copies of the software under the terms of that license.
