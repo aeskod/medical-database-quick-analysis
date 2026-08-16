@@ -9,6 +9,26 @@ It checks data quality, describes cohorts, and runs basic survival analyses.
 > Use this application only for exploratory research.
 > It does not replace clinical judgment or a statistical analysis plan.
 
+## Application Preview
+
+The screenshots below use the included lung cancer cohort.
+
+### Grouped Survival Analysis
+
+![Grouped Kaplan-Meier survival curves with confidence intervals, censor marks, and log-rank results](docs/images/survival-analysis.jpg)
+
+### Dataset Preview
+
+![Patient-level dataset preview with column types and missing-value highlighting](docs/images/dataset-preview.jpg)
+
+### Data Quality Review
+
+![Data quality dashboard with missing-value, validity, and analysis-readiness checks](docs/images/data-quality.jpg)
+
+### Exploratory Charts
+
+![Age distribution grouped by sex with summary statistics](docs/images/exploratory-chart.jpg)
+
 ## Features
 
 - Load CSV, TSV, TXT, and XLSX files.
