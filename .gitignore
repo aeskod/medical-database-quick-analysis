@@ -15,5 +15,8 @@ htmlcov/
 # Local Streamlit secrets
 .streamlit/secrets.toml
 
+# IDE settings
+.idea/
+
 # macOS
 .DS_Store
