@@ -6,8 +6,7 @@ It checks data quality, describes cohorts, and runs basic survival analyses.
 [Full user and administrator guide](docs/USER_GUIDE.md)
 
 > [!WARNING]
-> Use this application only for exploratory research.
-> It does not replace clinical judgment or a statistical analysis plan.
+> This application is not clinically licensed software.
 
 ## Application Preview
 
